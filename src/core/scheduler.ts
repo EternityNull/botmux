@@ -1,6 +1,7 @@
 import { Cron } from 'croner';
 import * as scheduleStore from '../services/schedule-store.js';
 import { logger } from '../utils/logger.js';
+import { dashboardEventBus } from './dashboard-events.js';
 import type { ScheduledTask, ParsedSchedule } from '../types.js';
 
 // Callback set by daemon to execute a scheduled task
@@ -42,6 +43,11 @@ function taskBelongsToThisDaemon(task: ScheduledTask): boolean {
   if (task.larkAppId) return task.larkAppId === ownerAppId;
   // No larkAppId on task (legacy) — only the primary (bot-0) handles it.
   return ownerIsPrimary;
+}
+
+/** Public ownership check — used by dashboard IPC to filter list-by-owner. */
+export function belongsToOwner(task: ScheduledTask): boolean {
+  return taskBelongsToThisDaemon(task);
 }
 
 // ─── Chinese NL parsing (schedule portion only, returns ParsedSchedule) ─────
@@ -453,4 +459,61 @@ export function getNextRun(id: string): Date | null {
   const task = scheduleStore.getTask(id);
   if (!task?.nextRunAt) return null;
   return new Date(task.nextRunAt);
+}
+
+// ─── Dashboard IPC helpers ──────────────────────────────────────────────────
+// Thin {ok, error?}-shaped wrappers used by the web dashboard.  They invoke
+// the real scheduler primitives above and additionally publish dashboard
+// events so subscribed SSE clients see the state change immediately.
+
+/**
+ * Fire a scheduled task immediately. Returns ok=false if id not found or the
+ * scheduler hasn't been initialised with an executeCallback yet.  Emits a
+ * `schedule.fired` event on completion (success or error).
+ */
+export function runNow(id: string): { ok: boolean; error?: string } {
+  const task = scheduleStore.getTask(id);
+  if (!task) return { ok: false, error: 'not_found' };
+  if (!executeCallback) return { ok: false, error: 'not_initialised' };
+  // Don't block the caller — fire on next tick.
+  void executeCallback(task).then(
+    () => {
+      scheduleStore.markRun(task.id, true);
+      dashboardEventBus.publish({
+        type: 'schedule.fired',
+        body: { id, runAt: Date.now(), status: 'ok' },
+      });
+    },
+    err => {
+      const msg = err instanceof Error ? err.message : String(err);
+      scheduleStore.markRun(task.id, false, msg);
+      dashboardEventBus.publish({
+        type: 'schedule.fired',
+        body: { id, runAt: Date.now(), status: 'error', error: msg },
+      });
+    },
+  );
+  return { ok: true };
+}
+
+/**
+ * Toggle a task's `enabled` flag and persist.  When enabling a task we also
+ * recompute `nextRunAt` so the next tick can pick it up.  Emits a
+ * `schedule.updated` event.
+ */
+export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?: string } {
+  const task = scheduleStore.getTask(id);
+  if (!task) return { ok: false, error: 'not_found' };
+  if (task.enabled === enabled) return { ok: true }; // no-op
+  if (enabled) {
+    const next = computeNextRun(task.parsed);
+    scheduleStore.updateTask(id, { enabled: true, nextRunAt: next ?? undefined });
+  } else {
+    scheduleStore.updateTask(id, { enabled: false });
+  }
+  dashboardEventBus.publish({
+    type: 'schedule.updated',
+    body: { id, patch: { enabled } },
+  });
+  return { ok: true };
 }

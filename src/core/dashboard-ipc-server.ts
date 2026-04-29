@@ -2,11 +2,13 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { logger } from '../utils/logger.js';
 import * as sessionStore from '../services/session-store.js';
+import * as scheduleStore from '../services/schedule-store.js';
+import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession } from './worker-pool.js';
 import { replyMessage } from '../im/lark/client.js';
 import { locateLimiter } from './dashboard-locate.js';
 import type { DaemonSession } from './types.js';
-import type { Session } from '../types.js';
+import type { Session, ScheduledTask, ParsedSchedule } from '../types.js';
 import type { CliId } from '../adapters/cli/types.js';
 
 export interface IpcServerHandle {
@@ -194,6 +196,62 @@ ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) =>
     jsonRes(res, 502, { ok: false, error: String(err) });
   }
 });
+
+// ─── Schedules ─────────────────────────────────────────────────────────────
+
+export interface ScheduleRow {
+  id: string;
+  name: string;
+  parsed: ParsedSchedule;
+  prompt: string;
+  workingDir: string;
+  chatId: string;
+  rootMessageId?: string;
+  larkAppId?: string;
+  botName?: string;
+  enabled: boolean;
+  createdAt: string;
+  lastRunAt?: string;
+  nextRunAt?: string;
+  lastStatus?: 'ok' | 'error';
+  lastError?: string;
+  repeat?: { times: number | null; completed: number };
+  feishuChatLink: string;
+}
+
+function composeScheduleRow(t: ScheduledTask): ScheduleRow {
+  return {
+    id: t.id,
+    name: t.name,
+    parsed: t.parsed,
+    prompt: t.prompt,
+    workingDir: t.workingDir,
+    chatId: t.chatId,
+    rootMessageId: t.rootMessageId,
+    larkAppId: t.larkAppId,
+    botName: cachedBotName,
+    enabled: t.enabled,
+    createdAt: t.createdAt,
+    lastRunAt: t.lastRunAt,
+    nextRunAt: t.nextRunAt,
+    lastStatus: t.lastStatus,
+    lastError: t.lastError,
+    repeat: t.repeat,
+    feishuChatLink: feishuChatLink(t.chatId),
+  };
+}
+
+ipcRoute('GET', '/api/schedules', (_req, res) => {
+  // Filter to tasks owned by this daemon's bot (multi-bot setups run one
+  // daemon per bot — each only manages its own schedules).  belongsToOwner
+  // falls through to "all tasks" when no owner filter is configured (tests).
+  const all = scheduleStore.listTasks().filter(t => scheduler.belongsToOwner(t));
+  jsonRes(res, 200, { schedules: all.map(composeScheduleRow) });
+});
+
+ipcRoute('POST', '/api/schedules/:id/run',    (_req, res, p) => jsonRes(res, 200, scheduler.runNow(p.id)));
+ipcRoute('POST', '/api/schedules/:id/pause',  (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, false)));
+ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, true)));
 
 export function startIpcServer(opts: { port: number; host: string }): Promise<IpcServerHandle> {
   return new Promise((resolve, reject) => {

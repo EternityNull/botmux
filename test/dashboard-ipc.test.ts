@@ -62,3 +62,42 @@ describe('POST /api/sessions/:sessionId/locate rate limit', () => {
     expect(second.headers.get('retry-after')).toBeTruthy();
   });
 });
+
+describe('GET /api/schedules', () => {
+  it('returns schedules array shape', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/schedules`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(Array.isArray(body.schedules)).toBe(true);
+  });
+});
+
+describe('POST /api/schedules/:id/(run|pause|resume)', () => {
+  it('returns ok=false for unknown id (run)', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/schedules/nonexistent/run`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error).toBe('not_found');
+  });
+
+  it('returns ok=false for unknown id (pause)', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/schedules/nonexistent/pause`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error).toBe('not_found');
+  });
+
+  it('returns ok=false for unknown id (resume)', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/schedules/nonexistent/resume`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error).toBe('not_found');
+  });
+});
