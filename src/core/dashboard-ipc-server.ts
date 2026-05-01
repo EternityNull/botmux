@@ -6,7 +6,7 @@ import * as scheduleStore from '../services/schedule-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession } from './worker-pool.js';
-import { replyMessage } from '../im/lark/client.js';
+import { replyMessage, sendMessage } from '../im/lark/client.js';
 import { locateLimiter } from './dashboard-locate.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import {
@@ -258,13 +258,20 @@ ipcRoute('POST', '/api/groups/:chatId/add-bots', async (req, res, p) => {
 // to act as creator, then forwards here.
 ipcRoute('POST', '/api/groups/create', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  let body: { name?: unknown; larkAppIds?: unknown; userOpenIds?: unknown; transferOwnerTo?: unknown };
+  let body: {
+    name?: unknown;
+    larkAppIds?: unknown;
+    userOpenIds?: unknown;
+    transferOwnerTo?: unknown;
+    notifyOwnerOpenId?: unknown;
+  };
   try {
     body = await readJsonBody<{
       name?: string;
       larkAppIds?: string[];
       userOpenIds?: string[];
       transferOwnerTo?: string;
+      notifyOwnerOpenId?: string;
     }>(req);
   } catch {
     return jsonRes(res, 400, { error: 'bad_json' });
@@ -273,15 +280,18 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
   if (!Array.isArray(body.larkAppIds) || !body.larkAppIds.every(x => typeof x === 'string')) {
     return jsonRes(res, 400, { error: 'larkAppIds_required' });
   }
-  // userOpenIds and transferOwnerTo are optional; pre-validated upstream by
-  // the dashboard route. transferOwnerTo's open_id MUST be in the calling
-  // bot's app scope (caller is responsible for that — Lark open_ids are
-  // app-scoped; see dashboard/operator-selector.ts).
+  // userOpenIds, transferOwnerTo, notifyOwnerOpenId are optional; pre-validated
+  // upstream by the dashboard route. All open_ids MUST be in the calling bot's
+  // app scope (caller is responsible — Lark open_ids are app-scoped, see
+  // dashboard/operator-selector.ts).
   const userIds = Array.isArray(body.userOpenIds) && body.userOpenIds.every(x => typeof x === 'string')
     ? (body.userOpenIds as string[])
     : [];
   const transferTo = typeof body.transferOwnerTo === 'string' && body.transferOwnerTo.trim()
     ? body.transferOwnerTo.trim()
+    : null;
+  const notifyTo = typeof body.notifyOwnerOpenId === 'string' && body.notifyOwnerOpenId.trim()
+    ? body.notifyOwnerOpenId.trim()
     : null;
   try {
     const r = await groupsStore.createChat(cachedLarkAppId, {
@@ -302,6 +312,28 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
         else transferError = tr.error;
       }
     }
+    // Send a bare @-mention into the new chat so the operator gets a Feishu
+    // push notification — that's the most reliable way to make the chat
+    // surface in their sidebar (membership alone isn't always enough on
+    // mobile). Skipped if invite was rejected (non-member) or no notifyTo.
+    let notifyMessageId: string | null = null;
+    let notifyError: string | null = null;
+    if (notifyTo) {
+      if (r.invalidUserIds.includes(notifyTo)) {
+        notifyError = 'invitee_rejected';
+      } else {
+        try {
+          notifyMessageId = await sendMessage(
+            cachedLarkAppId,
+            r.chatId,
+            `<at user_id="${notifyTo}"></at>`,
+            'text',
+          );
+        } catch (e: any) {
+          notifyError = e?.message ?? String(e);
+        }
+      }
+    }
     jsonRes(res, 200, {
       ok: true,
       chatId: r.chatId,
@@ -310,6 +342,8 @@ ipcRoute('POST', '/api/groups/create', async (req, res) => {
       creator: cachedLarkAppId,
       ownerTransferredTo,
       transferError,
+      notifyMessageId,
+      notifyError,
     });
   } catch (e) {
     jsonRes(res, 502, { ok: false, error: String((e as Error).message ?? e) });

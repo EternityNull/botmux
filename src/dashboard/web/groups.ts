@@ -120,6 +120,8 @@ export async function renderGroupsPage(root: HTMLElement) {
     const rejected = !!resp.autoInviteRejected;
     const ownerTo = resp.ownerTransferredTo as string | null | undefined;
     const transferErr = resp.transferError as string | null | undefined;
+    const notifyMsgId = resp.notifyMessageId as string | null | undefined;
+    const notifyErr = resp.notifyError as string | null | undefined;
     let inviteNote: string;
     if (auto) {
       const transferLine = ownerTo
@@ -127,7 +129,12 @@ export async function renderGroupsPage(root: HTMLElement) {
         : transferErr
           ? `<br><small class="hint-warn-inline">⚠ 自动转让群主失败（${escapeHtml(transferErr)}），你现在是成员但群主仍是机器人。</small>`
           : '';
-      inviteNote = `<p class="hint-ok">已自动邀请你（<code>${escapeHtml(auto)}</code>）作为成员，新群应该会出现在你的飞书侧边栏。${transferLine}</p>`;
+      const notifyLine = notifyMsgId
+        ? `<br><small>机器人已在群里 @ 了你（消息 id <code>${escapeHtml(notifyMsgId)}</code>），看飞书通知就能进群。</small>`
+        : notifyErr
+          ? `<br><small class="hint-warn-inline">⚠ 自动 @ 通知失败（${escapeHtml(notifyErr)}），新群可能不会主动出现在你侧边栏，建议从下面按钮跳进去。</small>`
+          : '';
+      inviteNote = `<p class="hint-ok">已自动邀请你（<code>${escapeHtml(auto)}</code>）作为成员。${transferLine}${notifyLine}</p>`;
     } else if (rejected) {
       inviteNote = `<p class="hint-warn">飞书拒绝了自动邀请（你的 open_id 在创建者 bot 的 scope 下不可用）。<strong>你目前不是新群成员</strong>，需要让群里的某个机器人手动把你加进来。</p>`;
     } else {

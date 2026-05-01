@@ -362,6 +362,11 @@ const server = createServer(async (req, res) => {
         // app-scope guarantee as the invite — the open_id we resolved came
         // from a session whose larkAppId is the creator daemon.
         transferOwnerTo: autoInvited ?? undefined,
+        // Send an @-mention message into the new chat so the operator gets
+        // a Feishu push notification — being a chat member alone doesn't
+        // always surface the chat in their sidebar (esp. mobile). Same
+        // app-scope guarantee as transferOwnerTo.
+        notifyOwnerOpenId: autoInvited ?? undefined,
       };
       const upstream = await fetch(
         `http://127.0.0.1:${creator.ipcPort}/api/groups/create`,

@@ -21,7 +21,12 @@ table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nu
 th, td { padding: 0.4rem 0.6rem; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
 th { background: var(--header-bg); font-weight: 600; }
 tr[data-id]:hover { background: #f6f8fa; cursor: pointer; }
-button { padding: 0.25rem 0.6rem; border: 1px solid var(--border); background: white; border-radius: 4px; cursor: pointer; }
+button { padding: 0.25rem 0.6rem; border: 1px solid var(--border); background: white; border-radius: 4px; cursor: pointer;
+  /* iOS Safari renders default <button> with -webkit-appearance: button which
+     can hide our text under a system gradient on small screens. Reset to
+     normalize so "Create" / "Cancel" / etc. render reliably across mobile. */
+  color: var(--fg); font-family: inherit; font-size: inherit; line-height: 1.2;
+  -webkit-appearance: none; appearance: none; }
 button:disabled { opacity: 0.5; cursor: default; }
 button.contrast { background: #cf222e; color: white; border-color: #cf222e; }
 .btn-link { display: inline-block; padding: 0.25rem 0.6rem; border: 1px solid var(--border); border-radius: 4px; text-decoration: none; color: var(--fg); }
