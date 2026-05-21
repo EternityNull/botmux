@@ -27,13 +27,15 @@ export interface CliAdapter {
   readonly resolvedBin: string;
 
   /** Build spawn arguments (bin comes from resolvedBin).
-   *  Note: workingDir is NOT passed here — it's the backend's cwd, not a CLI arg.
+   *  The backend also spawns the process in `workingDir`; adapters may use the
+   *  same value when a CLI needs an explicit workspace-root flag.
    *  When initialPrompt is provided and the adapter supports it, the prompt
    *  is baked into CLI args (e.g. Gemini's -i flag) instead of being written
    *  to stdin after idle detection. */
   buildArgs(opts: {
     sessionId: string;
     resume: boolean;
+    workingDir?: string;
     /** CLI-native session id used for resume when it differs from botmux's session id. */
     resumeSessionId?: string;
     initialPrompt?: string;

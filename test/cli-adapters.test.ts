@@ -161,6 +161,16 @@ describe('codex buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
     expect(args).not.toContain('sess-4');
   });
+
+  it('passes the effective working directory as Codex agent root', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo/root' });
+    expect(args).toEqual([
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
+      '-C',
+      '/repo/root',
+    ]);
+  });
 });
 
 describe('gemini buildArgs', () => {

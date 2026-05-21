@@ -830,6 +830,23 @@ describe('codex writeInput submission confirmation', () => {
     ]);
   });
 
+  it('buildArgs does not override Codex resume cwd with -C', () => {
+    resetCodexHistory();
+    const adapter = createCodexAdapter('/bin/codex');
+
+    expect(adapter.buildArgs({
+      sessionId: 'botmux-session',
+      resume: true,
+      resumeSessionId: '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
+      workingDir: '/repo/root',
+    })).toEqual([
+      'resume',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
+      '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
+    ]);
+  });
+
   it('buildArgs falls back to the latest history entry containing the botmux session id', () => {
     resetCodexHistory();
     appendCodexHistory('<session_id>botmux-session</session_id>', 'old-codex-session');
@@ -852,6 +869,22 @@ describe('codex writeInput submission confirmation', () => {
     expect(adapter.buildArgs({ sessionId: 'botmux-session', resume: true })).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
+    ]);
+  });
+
+  it('buildArgs pins cwd when resume falls back to a fresh Codex session', () => {
+    resetCodexHistory();
+    const adapter = createCodexAdapter('/bin/codex');
+
+    expect(adapter.buildArgs({
+      sessionId: 'botmux-session',
+      resume: true,
+      workingDir: '/repo/root',
+    })).toEqual([
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
+      '-C',
+      '/repo/root',
     ]);
   });
 

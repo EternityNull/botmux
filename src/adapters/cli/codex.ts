@@ -110,15 +110,19 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     id: 'codex',
     resolvedBin: bin,
 
-    buildArgs({ sessionId, resume, resumeSessionId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir }) {
       const baseArgs = [
         '--dangerously-bypass-approvals-and-sandbox',
         '--no-alt-screen',
       ];
-      if (!resume) return baseArgs;
+      // Codex app-server can keep its own cwd at $HOME; -C pins fresh agent roots.
+      const freshArgs = workingDir
+        ? [...baseArgs, '-C', workingDir]
+        : baseArgs;
+      if (!resume) return freshArgs;
 
       const codexSessionId = resumeSessionId ?? latestCodexSessionForBotmuxSession(sessionId);
-      if (!codexSessionId) return baseArgs;
+      if (!codexSessionId) return freshArgs;
       return ['resume', ...baseArgs, codexSessionId];
     },
 

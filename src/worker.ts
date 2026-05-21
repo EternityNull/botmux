@@ -2471,6 +2471,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   const args = cliAdapter.buildArgs({
     sessionId: cfg.sessionId,
     resume: cfg.resume ?? false,
+    workingDir: cfg.workingDir,
     resumeSessionId: cfg.cliSessionId,
     initialPrompt: cfg.prompt || undefined,
     botName: cfg.botName,
