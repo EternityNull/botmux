@@ -31,7 +31,7 @@ import { TEAM_PAGE_HTML } from './team-page.js';
  *  bmx_session route must let them fall through to the post-gate handler. Keep
  *  in sync with handleFederationSpokeApi's path set. */
 const FEDERATION_DASHBOARD_PATHS = new Set([
-  '/api/team/local', '/api/team/local-invite', '/api/team/rename-deployment',
+  '/api/team/local', '/api/team/local-invite', '/api/team/rename-deployment', '/api/team/federated-group',
   '/api/team/join-remote', '/api/team/remote-roster', '/api/team/sync-remote', '/api/team/leave-remote',
 ]);
 

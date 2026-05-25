@@ -100,17 +100,23 @@ Hub 的团队花名册 = 本地 bot（[[team-roster]]，按 bots.json 顺序）+
 远端部署超过 `FEDERATION_STALE_MS`（5min）未同步即标 `stale`（疑似离线）——不硬隐藏，留 UI 降级展示。
 `AggregatedRosterBot` 保留 `botUnionId?`（P2 拉群按 union_id 加 bot 时免改接口）。
 
-## 拉群（跨部署，P2）
+## 拉群（跨部署，P2 — 已实现）
 
-加 bot 进飞书群必须由「控制该 bot 的 daemon」来做：
-- **路 1（首选）**：同租户下建群 bot 用 **union_id** 直接把对方 bot 加进群——一步到位，不碰对方 daemon。
-  ⚠️ **待验证**：飞书 `im/v1/chats/:chat_id/members` 是否支持 `member_id_type=union_id` 且能加「另一个 app 的 bot」成员。
-- **路 2（回退）**：若飞书不允许跨 app 直接加，则 hub 把「加入群 X」挂成任务，**对方 dashboard/daemon 轮询**拉取后由它自己的 bot 加入（spoke 主动拉，无需对外暴露端口）。
+**关键事实**：飞书加 bot 进群用的是 **app_id**（`im/v1/chats` 的 `bot_id_list`、`im/v1/chats/:id/members` 的 `member_id_type=app_id`），**不是 union_id**。
+而 botmux 每个 bot 本就是独立飞书 app，现有 `/group` 早已在「同一个群里加多个不同 app 的 bot」——「跨 app 加 bot」在本部署已验证可用。**联邦 bot 也是同租户的另一个 app，加法完全相同。**（早先 union_id 的顾虑是误解，已纠正。）
+
+所以 P2 直接**复用现有建群链路**，无需新机制、无需 spike：
+- Hub 的建群由它**自己某个在线本地 bot** 当 creator（创建 chat 必须本机 daemon 发起）。
+- 选中的 bot（本地 + 联邦）全部按 **larkAppId** 进 `bot_id_list`；联邦 bot 由 Feishu 按 app_id 加入，加不上的进 `invalid_bot_id_list`。
+- 联邦 bot 被加进群后，它**自己部署的 daemon**（订阅了该 app 事件）自动感知该群并参与——Hub 不碰对方 daemon。
+- 校验：选中 app_id 必须都在**聚合花名册**里；至少一个本地在线 bot 作 creator（否则 `no_online_daemon`）。
+
+实现：`POST /api/team/federated-group {name, larkAppIds}`（dashboard token），校验聚合花名册后复用 `createTeamGroup`（pickCreator 只从本地在线 bot 里选，联邦 bot 自然只作被加成员）。operator 不自动入群（用 share link 进），避开 open_id app-scope。
 
 ## 分期
 
-- **P1（本次）**：联邦基础——部署身份 + 邀请注册 + 同步/心跳 + 聚合花名册 + spoke 加入/拉花名册 API。先让大家「看到彼此的 bot」。
-- **P2**：跨部署拉群（按上面两条路，先验证飞书 union_id 加 bot）。
+- **P1**：联邦基础——部署身份 + 邀请注册 + 同步/心跳 + 聚合花名册 + spoke 加入/拉花名册 API。让大家「看到彼此的 bot」。
+- **P2**：跨部署拉群——复用现有 createChat 按 app_id 加联邦 bot（见上，已实现）。
 - **P3**：跨部署共享 connector / 团队角色（按需）。
 
 ## 与现有代码的关系

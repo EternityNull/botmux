@@ -52,6 +52,12 @@ function pageHtml(): string {
 <div class="card" style="margin-bottom:16px">
   <h2 style="margin-top:0">团队花名册 <span class="muted" id="tf-roster-meta" style="font-size:13px"></span></h2>
   <div id="tf-roster">加载中…</div>
+  <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <input id="tf-grp-name" placeholder="群名（如：跨团队排障）" style="min-width:200px">
+    <button id="tf-grp" class="primary">把勾选的机器人拉一个群</button>
+    <span class="muted" style="font-size:13px">勾选机器人（可跨部署）→ 拉到一个飞书群协作</span>
+  </div>
+  <div id="tf-grp-out" style="display:none;margin-top:8px"></div>
 </div>
 
 <div class="card">
@@ -74,7 +80,7 @@ function renderRoster(el: HTMLElement, deployments: RosterDeployment[], bots: Ro
       const cap = b.capability ? escapeHtml(b.capability) : '<span class="muted">—</span>';
       const role = b.hasTeamRole ? '有角色' : '<span class="muted">—</span>';
       const dim = b.deployment.stale ? 'opacity:.55' : '';
-      html += `<tr style="${dim}"><td style="padding:4px 8px">${escapeHtml(b.name)}</td><td style="padding:4px 8px" class="muted">${escapeHtml(b.cliId)}</td><td style="padding:4px 8px">${cap}</td><td style="padding:4px 8px">${role}</td></tr>`;
+      html += `<tr style="${dim}"><td style="padding:4px 8px"><input type="checkbox" class="tf-pick" data-app="${escapeHtml(b.larkAppId)}"></td><td style="padding:4px 8px">${escapeHtml(b.name)}</td><td style="padding:4px 8px" class="muted">${escapeHtml(b.cliId)}</td><td style="padding:4px 8px">${cap}</td><td style="padding:4px 8px">${role}</td></tr>`;
     }
     html += '</tbody></table>';
   }
@@ -161,6 +167,26 @@ export function renderTeamFederationPage(root: HTMLElement): void {
   document.getElementById('tf-sync')!.onclick = async () => {
     await jpost('/api/team/sync-remote');
     loadRemote();
+  };
+
+  document.getElementById('tf-grp')!.onclick = async () => {
+    const apps = Array.from(document.querySelectorAll<HTMLInputElement>('.tf-pick:checked')).map(c => c.dataset.app!);
+    const out = document.getElementById('tf-grp-out')!;
+    out.style.display = '';
+    if (!apps.length) { out.innerHTML = '<span class="err">请先勾选至少一个机器人。</span>'; return; }
+    const name = (document.getElementById('tf-grp-name') as HTMLInputElement).value.trim() || '协作群';
+    out.innerHTML = '<span class="muted">建群中…</span>';
+    const r = await jpost('/api/team/federated-group', { name, larkAppIds: apps });
+    const b: any = r.body;
+    if (b?.ok && b.chatId) {
+      const link = b.shareLink || ('https://applink.feishu.cn/client/chat/open?openChatId=' + encodeURIComponent(b.chatId));
+      const invalid = (b.invalidBotIds || []).length ? `<p class="hint err">未能加入的机器人：${escapeHtml((b.invalidBotIds || []).join(', '))}</p>` : '';
+      out.innerHTML = `<span class="ok">群已创建</span> · <a href="${escapeHtml(link)}" target="_blank">在飞书打开</a>${invalid}`;
+    } else {
+      const e = b?.error || r.status;
+      const msg = e === 'no_online_daemon' ? '你这边没有在线的本地机器人来建群（建群必须由本部署的机器人发起，请至少勾选一个本部署的在线机器人）' : `建群失败：${e}`;
+      out.innerHTML = `<span class="err">${escapeHtml(String(msg))}</span>`;
+    }
   };
 
   void loadLocal();

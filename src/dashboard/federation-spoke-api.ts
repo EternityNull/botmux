@@ -106,6 +106,11 @@ export async function syncAllMemberships(dataDir: string, fetcher: Fetcher = fet
 export interface FederationSpokeDeps {
   dataDir?: string;
   fetcher?: Fetcher;
+  /** Injected by dashboard.ts — picks a local online creator + proxies to its
+   *  daemon's /api/groups/create (federated bots are added by larkAppId). */
+  createTeamGroup?: (args: { name: string; larkAppIds: string[] }) => Promise<{
+    ok: boolean; chatId?: string; shareLink?: string; invalidBotIds?: string[]; error?: string;
+  }>;
 }
 
 export async function handleFederationSpokeApi(
@@ -115,12 +120,32 @@ export async function handleFederationSpokeApi(
   deps: FederationSpokeDeps = {},
 ): Promise<boolean> {
   const path = url.pathname;
-  const LOCAL = new Set(['/api/team/local', '/api/team/local-invite', '/api/team/rename-deployment']);
+  const LOCAL = new Set(['/api/team/local', '/api/team/local-invite', '/api/team/rename-deployment', '/api/team/federated-group']);
   const REMOTE = new Set(['/api/team/join-remote', '/api/team/remote-roster', '/api/team/sync-remote', '/api/team/leave-remote']);
   if (!LOCAL.has(path) && !REMOTE.has(path)) return false;
   const dataDir = deps.dataDir ?? config.session.dataDir;
   const fetcher = deps.fetcher ?? fetch;
   const method = req.method ?? 'GET';
+
+  // Cross-deployment 拉群: create a Feishu group with selected bots (local +
+  // federated). Bots are added by larkAppId (app_id) — the creator is picked
+  // from local online bots; federated bots (other apps, same tenant) are added
+  // as members. See docs/federation-design.md.
+  if (path === '/api/team/federated-group' && method === 'POST') {
+    if (!deps.createTeamGroup) { jsonRes(res, 501, { ok: false, error: 'group_create_unavailable' }); return true; }
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    const larkAppIds: string[] = Array.isArray(body?.larkAppIds) ? body.larkAppIds.filter((x: any) => typeof x === 'string') : [];
+    const name = (String(body?.name ?? '').trim()) || '协作群';
+    if (larkAppIds.length === 0) { jsonRes(res, 400, { ok: false, error: 'no_bots_selected' }); return true; }
+    // Only bots on the aggregated roster (local + federated) — block bad ids.
+    const rosterIds = new Set(buildFederatedRoster(dataDir, DEFAULT_TEAM_ID).bots.map(b => b.larkAppId));
+    const unknown = larkAppIds.filter(id => !rosterIds.has(id));
+    if (unknown.length) { jsonRes(res, 400, { ok: false, error: 'unknown_bot', unknown }); return true; }
+    const r = await deps.createTeamGroup({ name, larkAppIds });
+    jsonRes(res, r.ok ? 200 : 502, r);
+    return true;
+  }
 
   // ── Local team (this deployment as a Hub: identity + own roster + invites) ──
   if (path === '/api/team/local' && method === 'GET') {

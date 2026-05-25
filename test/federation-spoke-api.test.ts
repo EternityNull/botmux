@@ -19,6 +19,7 @@ import { listMemberships } from '../src/services/federation-membership-store.js'
 import { getDeploymentIdentity } from '../src/services/deployment-identity.js';
 import { consumeInvite } from '../src/services/invite-store.js';
 import { DEFAULT_TEAM_ID } from '../src/services/team-store.js';
+import { registerDeployment } from '../src/services/federation-store.js';
 
 let dataDir: string;
 beforeEach(() => { dataDir = mkdtempSync(join(tmpdir(), 'botmux-spoke-')); state.dataDir = dataDir; });
@@ -71,6 +72,33 @@ describe('handleFederationSpokeApi', () => {
     await handleFederationSpokeApi(makeReq('POST', '/api/team/rename-deployment', { name: '申晗的部署' }), res, new URL('http://x/api/team/rename-deployment'), { dataDir });
     expect(res.statusCode).toBe(200);
     expect(json(res).deployment).toMatchObject({ deploymentId: before.deploymentId, name: '申晗的部署' });
+  });
+
+  it('federated-group: validates against aggregated roster, delegates local+federated app_ids to createTeamGroup', async () => {
+    writeBots([{ larkAppId: 'cli_local', botOpenId: null, botName: '本地Bot', cliId: 'claude' }]);
+    registerDeployment(dataDir, DEFAULT_TEAM_ID, { deploymentId: 'dep_r', name: '远端', bots: [{ larkAppId: 'cli_remote', botName: '远端Bot', cliId: 'codex' }] });
+    let captured: any = null;
+    const createTeamGroup = vi.fn(async (args: any) => { captured = args; return { ok: true, chatId: 'oc_x', shareLink: 'https://x/join', invalidBotIds: [] }; });
+    const url = new URL('http://x/api/team/federated-group');
+    // valid local + federated selection → delegated
+    let res = makeRes();
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/federated-group', { name: '排障', larkAppIds: ['cli_local', 'cli_remote'] }), res, url, { dataDir, createTeamGroup: createTeamGroup as any });
+    expect(res.statusCode).toBe(200);
+    expect(json(res).chatId).toBe('oc_x');
+    expect(captured.larkAppIds.sort()).toEqual(['cli_local', 'cli_remote']);
+    // unknown bot (not on aggregated roster) → 400, never delegated
+    res = makeRes();
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/federated-group', { larkAppIds: ['cli_ghost'] }), res, url, { dataDir, createTeamGroup: createTeamGroup as any });
+    expect(res.statusCode).toBe(400);
+    expect(json(res).error).toBe('unknown_bot');
+    // empty selection → 400
+    res = makeRes();
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/federated-group', { larkAppIds: [] }), res, url, { dataDir, createTeamGroup: createTeamGroup as any });
+    expect(json(res).error).toBe('no_bots_selected');
+    // no creator dep → 501
+    res = makeRes();
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/federated-group', { larkAppIds: ['cli_local'] }), res, url, { dataDir });
+    expect(res.statusCode).toBe(501);
   });
 
   it('join-remote: posts local bots to the hub and stores the membership', async () => {
