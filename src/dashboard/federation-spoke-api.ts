@@ -25,7 +25,7 @@ import type { FederatedBot } from '../services/federation-store.js';
 import { listFederatedDeployments } from '../services/federation-store.js';
 import { ensureDefaultTeam, DEFAULT_TEAM_ID } from '../services/team-store.js';
 import { createInvite } from '../services/invite-store.js';
-import { loadBotConfigs } from '../bot-registry.js';
+import { loadBotConfigs, registerBot, getBot, type BotConfig } from '../bot-registry.js';
 import { setBotCapability, clearBotCapability } from '../services/bot-profile-store.js';
 import { setBotOwner } from '../services/bot-owner-store.js';
 import { setDeploymentOwner } from '../services/deployment-identity.js';
@@ -35,26 +35,45 @@ import { fetchWithTimeout, hubError, orchestrateFederatedGroup, type Fetcher } f
 
 export interface OwnerCandidate { unionId: string; name: string }
 
+/** Injectable seams for the owner resolver (defaults hit Feishu via the bot's
+ *  own credentials). Lets the resolver's registry/iteration logic be unit-tested
+ *  without network. */
+interface OwnerResolveDeps {
+  configs?: () => BotConfig[];
+  /** Ensure a usable Lark client exists for cfg. The DASHBOARD process has no bot
+   *  registry (it proxies to daemons), so getBotClient() would throw — register
+   *  the cfg on demand (it carries the app secret from bots.json). */
+  ensureClient?: (cfg: BotConfig) => void;
+  resolveAllowed?: (larkAppId: string, allowed: string[]) => Promise<string[]>;
+  resolveUnion?: (larkAppId: string, openId: string) => Promise<{ unionId?: string; name?: string }>;
+}
+
 /** Resolve this deployment's owner identity from bots.json `allowedUsers` using
- *  each bot's OWN app credentials (no /pair, no shared pairings.json — so it's
- *  immune to the dataDir-split that broke /pair). Uses the FIRST bot that has
- *  allowedUsers (they're almost always the single owner); returns the distinct
- *  resolved {unionId,name} so the UI can auto-bind (1) or let the owner pick (N). */
-async function resolveOwnerCandidatesFromAllowedUsers(): Promise<OwnerCandidate[]> {
-  let configs: { larkAppId: string; allowedUsers?: string[] }[] = [];
-  try { configs = loadBotConfigs(); } catch { return []; }
+ *  each bot's OWN app credentials (no /pair, no shared pairings.json — immune to
+ *  the dataDir-split that broke /pair). Walks bots with allowedUsers in order;
+ *  returns the first bot's distinct resolved {unionId,name} (skips bots that
+ *  resolve to nothing, so one mis-config doesn't hide the rest). The UI auto-binds
+ *  when there's exactly one, else lets the owner pick. */
+export async function resolveOwnerCandidatesFromAllowedUsers(d: OwnerResolveDeps = {}): Promise<OwnerCandidate[]> {
+  const loadConfigs = d.configs ?? loadBotConfigs;
+  const ensureClient = d.ensureClient ?? ((cfg: BotConfig) => { try { getBot(cfg.larkAppId); } catch { registerBot(cfg); } });
+  const resolveAllowed = d.resolveAllowed ?? (async (id, a) => (await resolveAllowedUsersWithMap(id, a)).resolved);
+  const resolveUnion = d.resolveUnion ?? resolveUserUnionId;
+  let configs: BotConfig[] = [];
+  try { configs = loadConfigs(); } catch { return []; }
   for (const cfg of configs) {
     const allowed = cfg.allowedUsers ?? [];
     if (allowed.length === 0) continue;
+    try { ensureClient(cfg); } catch { continue; }
     let openIds: string[] = [];
-    try { openIds = (await resolveAllowedUsersWithMap(cfg.larkAppId, allowed)).resolved; } catch { return []; }
+    try { openIds = await resolveAllowed(cfg.larkAppId, allowed); } catch { continue; } // one bot failing → try next
     const byUnion = new Map<string, OwnerCandidate>();
     for (const oid of openIds) {
       if (!oid.startsWith('ou_')) continue;
-      const u = await resolveUserUnionId(cfg.larkAppId, oid);
+      const u = await resolveUnion(cfg.larkAppId, oid);
       if (u.unionId) byUnion.set(u.unionId, { unionId: u.unionId, name: u.name ?? '' });
     }
-    return [...byUnion.values()];
+    if (byUnion.size > 0) return [...byUnion.values()];
   }
   return [];
 }

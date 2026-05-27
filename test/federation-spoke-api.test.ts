@@ -14,7 +14,7 @@ vi.mock('../src/config.js', () => ({ config: {
   dashboard: { externalHost: 'localhost', port: 7891 },
 } }));
 
-import { handleFederationSpokeApi } from '../src/dashboard/federation-spoke-api.js';
+import { handleFederationSpokeApi, resolveOwnerCandidatesFromAllowedUsers } from '../src/dashboard/federation-spoke-api.js';
 import { listMemberships, addMembership } from '../src/services/federation-membership-store.js';
 import { getDeploymentIdentity } from '../src/services/deployment-identity.js';
 import { consumeInvite } from '../src/services/invite-store.js';
@@ -131,6 +131,22 @@ describe('handleFederationSpokeApi', () => {
     expect(res.statusCode).toBe(200);
     expect(json(res).hubsSynced).toBe(1);
     expect(synced).toMatchObject({ syncToken: 'STOK', ownerUnionId: 'on_me' }); // hub gets owner NOW, not 2 min later
+  });
+
+  it('resolveOwnerCandidatesFromAllowedUsers (default resolver): ensures a client, skips empty/failing bots, dedups', async () => {
+    const ensured: string[] = [];
+    const cands = await resolveOwnerCandidatesFromAllowedUsers({
+      configs: () => ([
+        { larkAppId: 'cli_empty', larkAppSecret: 's', allowedUsers: [] },
+        { larkAppId: 'cli_a', larkAppSecret: 's', allowedUsers: ['a@x.com'] },          // resolves to nothing → try next
+        { larkAppId: 'cli_b', larkAppSecret: 's', allowedUsers: ['b@x.com', 'b2@x.com'] },
+      ] as any),
+      ensureClient: (cfg) => { ensured.push(cfg.larkAppId); }, // dashboard registers on demand (the blocker Codex caught)
+      resolveAllowed: async (id) => (id === 'cli_a' ? [] : ['ou_1', 'ou_1', 'ou_2']),
+      resolveUnion: async (_id, oid) => (oid === 'ou_1' ? { unionId: 'on_1', name: '甲' } : { unionId: 'on_2', name: '乙' }),
+    });
+    expect(ensured).toEqual(['cli_a', 'cli_b']);   // skipped the empty bot; ensured a client for each candidate bot
+    expect(cands).toEqual([{ unionId: 'on_1', name: '甲' }, { unionId: 'on_2', name: '乙' }]); // ou_1 deduped
   });
 
   it('identity/auto-bind: single candidate binds owner + owns bots (no /pair) + pushes to hub', async () => {
