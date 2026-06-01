@@ -3262,6 +3262,17 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         // stream, which scrolls stale Ink redraw/spinner frames into scrollback
         // at any size mismatch and produces the stacked-footer history garble.
         // See chooseWebTerminalSeed for the full rationale.
+        // Adopt observes a pane we CANNOT resize (tmux adopt has
+        // ownsSession=false so resize() is a no-op; zellij drives via
+        // dump-screen). The client's FitAddon sizes its xterm to the browser,
+        // but the snapshot lines carry the PANE's width — any mismatch wraps the
+        // full-width TUI box lines and garbles the layout (the misalignment 申晗
+        // saw). Pin the client xterm to the pane's fixed size via a botmux OSC
+        // (sent BEFORE the seed so the client resizes before rendering it).
+        if (lastInitConfig?.adoptMode && isObserveBackend(backend)) {
+          const sz = (backend as ObserveBackend).getPaneSize();
+          if (sz && sz.cols > 0 && sz.rows > 0) ws.send(`\x1b]1989;${sz.cols};${sz.rows}\x07`);
+        }
         const seed = chooseWebTerminalSeed({
           canCapture: isPipeMode && isObserveBackend(backend),
           capture: () => (backend as ObserveBackend).captureCurrentScreen(),
@@ -3456,8 +3467,9 @@ term.onData(function(d){
   }
   if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:'input',data:d}));
 });
+var fixedSize=false;
 function sendResize(){if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:'resize',cols:term.cols,rows:term.rows}))}
-window.addEventListener('resize',function(){fit.fit();sendResize()});
+window.addEventListener('resize',function(){if(!fixedSize){fit.fit()}sendResize()});
 (function connect(){
   var t=new URLSearchParams(location.search).get('token')||'';
   // Derive base from the current path so the WS connects to the same prefix the
@@ -3470,6 +3482,10 @@ window.addEventListener('resize',function(){fit.fit();sendResize()});
   ws.onopen=function(){el.textContent='connected';el.className='ok';sendResize()};
   ws.onmessage=function(e){
     var data=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);
+    // botmux OSC 1989: pin the xterm to the adopted pane's fixed size (the pane
+    // can't be resized, so FitAddon-to-browser would wrap the snapshot lines).
+    var _fs=data.match(/\\x1b\\]1989;(\\d+);(\\d+)\\x07/);
+    if(_fs){fixedSize=true;var _c=+_fs[1],_r=+_fs[2];if(_c>0&&_r>0){try{term.resize(_c,_r)}catch(ex){}}data=data.replace(_fs[0],'')}
     // Intercept OSC 52 clipboard sequence from tmux (set-clipboard on)
     var m=data.match(/\\x1b\\]52;[^;]*;([A-Za-z0-9+/=]+)(?:\\x07|\\x1b\\\\)/);
     if(m){try{_clipBuf=new TextDecoder().decode(Uint8Array.from(atob(m[1]),function(c){return c.charCodeAt(0)}));_doCopy(_clipBuf);_showCopied()}catch(ex){}}
