@@ -156,6 +156,10 @@ const MIME: Record<string, string> = {
   '.css': 'text/css',
   '.svg': 'image/svg+xml',
   '.woff2': 'font/woff2',
+  '.webp': 'image/webp',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
 };
 
 function serveStatic(_req: IncomingMessage, res: ServerResponse, pathname: string): boolean {

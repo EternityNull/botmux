@@ -6,11 +6,16 @@ import {
 } from './i18n.js';
 import {
   THEME_STORAGE_KEY,
+  SKIN_STORAGE_KEY,
   readStoredThemeMode,
+  readStoredSkin,
   resolveThemeMode,
   type ResolvedTheme,
   type ThemeMode,
+  type SkinId,
 } from './preferences.js';
+import { applyCyberFx } from './cyber-fx.js';
+import { playSkinIntro } from './skin-intro.js';
 
 type UiListener = () => void;
 
@@ -18,6 +23,7 @@ class DashboardUiState {
   locale: DashboardLocale = 'zh';
   themeMode: ThemeMode = 'system';
   resolvedTheme: ResolvedTheme = 'light';
+  skin: SkinId = 'default';
   private listeners = new Set<UiListener>();
   private translate = createDashboardTranslator(this.locale);
   private mediaQuery: MediaQueryList | null = null;
@@ -27,12 +33,14 @@ class DashboardUiState {
     this.locale = readStoredDashboardLocale(w?.localStorage, navigatorLanguages());
     this.translate = createDashboardTranslator(this.locale);
     this.themeMode = readStoredThemeMode(w?.localStorage);
+    this.skin = readStoredSkin(w?.localStorage);
     this.mediaQuery = w?.matchMedia?.('(prefers-color-scheme: dark)') ?? null;
     this.mediaQuery?.addEventListener('change', () => {
       this.applyTheme();
       this.emit();
     });
     this.applyTheme();
+    this.applySkin();
     this.applyLocale();
   }
 
@@ -49,11 +57,26 @@ class DashboardUiState {
     this.emit();
   }
 
-  setThemeMode(mode: ThemeMode): void {
-    if (this.themeMode === mode) return;
-    this.themeMode = mode;
-    window.localStorage.setItem(THEME_STORAGE_KEY, mode);
+  // The topbar exposes a single "Theme" dropdown whose value is either a base
+  // colour mode (system/light/dark → the `default` skin) or a named skin id.
+  get theme(): string {
+    return this.skin === 'default' ? this.themeMode : this.skin;
+  }
+
+  setTheme(value: string): void {
+    const isMode = value === 'system' || value === 'light' || value === 'dark';
+    const nextSkin: SkinId = isMode ? 'default' : (value as SkinId);
+    const skinChanged = nextSkin !== this.skin;
+    if (isMode && this.themeMode !== value) {
+      this.themeMode = value as ThemeMode;
+      window.localStorage.setItem(THEME_STORAGE_KEY, this.themeMode);
+    }
+    if (skinChanged) {
+      this.skin = nextSkin;
+      window.localStorage.setItem(SKIN_STORAGE_KEY, this.skin);
+    }
     this.applyTheme();
+    this.applySkin(skinChanged);
     this.emit();
   }
 
@@ -68,14 +91,43 @@ class DashboardUiState {
 
   private applyTheme(): void {
     this.resolvedTheme = resolveThemeMode(this.themeMode, !!this.mediaQuery?.matches);
-    document.documentElement.dataset.theme = this.resolvedTheme;
+    // A named skin ships its own light/dark palette, so drive data-theme from the
+    // skin's intrinsic mode — that way the base theme's light/dark component rules
+    // (incl. PR #123's dark-only overrides) match the skin instead of fighting it.
+    // The default skin follows the user's system/light/dark choice.
+    const themeAttr = this.skin === 'default' ? this.resolvedTheme : SKIN_THEME[this.skin];
+    document.documentElement.dataset.theme = themeAttr;
     document.documentElement.dataset.themeMode = this.themeMode;
+  }
+
+  // `animate` plays the boot loader — true when the user actively switches in,
+  // false on initial load so a refresh doesn't replay the 3s decrypt overlay.
+  private applySkin(animate = false): void {
+    document.documentElement.dataset.skin = this.skin;
+    applyCyberFx(this.skin === 'cyber', animate);
+    // 2077 plays its own boot loader; the other skins get a themed switch-in intro.
+    if (animate && this.skin !== 'cyber' && this.skin !== 'default') {
+      playSkinIntro(this.skin);
+    }
   }
 
   private applyLocale(): void {
     document.documentElement.lang = this.locale === 'zh' ? 'zh-CN' : 'en';
   }
 }
+
+// Each named skin's intrinsic light/dark mode (drives the data-theme attribute).
+const SKIN_THEME: Record<SkinId, ResolvedTheme> = {
+  default: 'light',
+  cyber: 'dark',
+  genshin: 'light',
+  fallout: 'dark',
+  prts: 'dark',
+  bluearchive: 'dark',
+  zzz: 'dark',
+  dragonball: 'light',
+  ikun: 'dark',
+};
 
 function navigatorLanguages(): readonly string[] {
   if (typeof navigator === 'undefined') return [];

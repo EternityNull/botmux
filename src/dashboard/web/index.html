@@ -46,10 +46,10 @@
             <button type="button" data-locale="zh">中</button>
             <button type="button" data-locale="en">EN</button>
           </div>
-          <div class="segmented theme-switch" aria-label="Theme">
-            <button type="button" data-theme-mode="system" data-i18n="status.system">系统</button>
-            <button type="button" data-theme-mode="light" data-i18n="status.light">浅色</button>
-            <button type="button" data-theme-mode="dark" data-i18n="status.dark">暗黑</button>
+          <div class="theme-menu" id="theme-menu">
+            <button type="button" class="theme-menu-btn" id="theme-menu-btn"
+                    aria-haspopup="listbox" aria-expanded="false" aria-label="Theme"></button>
+            <div class="theme-menu-pop" id="theme-menu-pop" role="listbox" hidden></div>
           </div>
         </div>
       </header>

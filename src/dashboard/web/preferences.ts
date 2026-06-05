@@ -66,3 +66,43 @@ export function writeStoredSessionsViewMode(storage: Storage | undefined, mode: 
     // Some embedded browsers deny localStorage. The current page still updates.
   }
 }
+
+// ── Skin (visual identity, orthogonal to light/dark) ──────────────────────────
+// `default` = the regular botmux look (honours the light/dark theme mode).
+// Every other id is a self-contained palette distilled from the kaboo webui; each
+// ships its own light/dark palette and ignores the light/dark theme mode.
+// `cyber` additionally layers on animated neon FX (the "2077" skin).
+export type SkinId =
+  | 'default'
+  | 'cyber'
+  | 'genshin'
+  | 'fallout'
+  | 'prts'
+  | 'bluearchive'
+  | 'zzz'
+  | 'dragonball'
+  | 'ikun';
+
+export const SKIN_IDS: readonly SkinId[] = [
+  'default',
+  'cyber',
+  'genshin',
+  'fallout',
+  'prts',
+  'bluearchive',
+  'zzz',
+  'dragonball',
+  'ikun',
+];
+
+export const SKIN_STORAGE_KEY = 'botmux.dashboard.skin';
+
+export function normalizeSkin(value: unknown): SkinId | null {
+  return typeof value === 'string' && (SKIN_IDS as readonly string[]).includes(value)
+    ? (value as SkinId)
+    : null;
+}
+
+export function readStoredSkin(storage: Storage | undefined): SkinId {
+  return normalizeSkin(storage?.getItem(SKIN_STORAGE_KEY)) ?? 'default';
+}

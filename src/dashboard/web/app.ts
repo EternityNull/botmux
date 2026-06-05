@@ -13,8 +13,8 @@ import { renderWorkflowsPage } from './workflows.js';
 import { renderWorkflowCatalogPage } from './workflow-catalog.js';
 import { wireBotOnboardingButton } from './bot-onboarding.js';
 import { attentionReason, botDisplayName, escapeHtml, loadNameMaps, relTime, t, ui } from './ui.js';
+import { initThemeMenu, paintThemeMenu } from './theme-menu.js';
 import type { DashboardLocale } from './i18n.js';
-import type { ThemeMode } from './preferences.js';
 
 const root = document.getElementById('root')!;
 
@@ -247,9 +247,7 @@ function paintChrome() {
   document.querySelectorAll<HTMLButtonElement>('[data-locale]').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.locale === ui.locale);
   });
-  document.querySelectorAll<HTMLButtonElement>('[data-theme-mode]').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.themeMode === ui.themeMode);
-  });
+  paintThemeMenu();
   paintStatus();
 }
 
@@ -257,9 +255,7 @@ function wireChromeControls() {
   document.querySelectorAll<HTMLButtonElement>('[data-locale]').forEach(btn => {
     btn.onclick = () => ui.setLocale(btn.dataset.locale as DashboardLocale);
   });
-  document.querySelectorAll<HTMLButtonElement>('[data-theme-mode]').forEach(btn => {
-    btn.onclick = () => ui.setThemeMode(btn.dataset.themeMode as ThemeMode);
-  });
+  initThemeMenu();
 }
 
 // esbuild's IIFE bundle does not support top-level await — use an async IIFE.
