@@ -14,6 +14,7 @@
  */
 
 import { isLoopNode, loopInstanceId, topologicalOrder, type V3Dag, type V3Node } from './dag.js';
+import type { V3RunFailureReason } from './journal.js';
 import type { V3LoopRef } from './journal.js';
 
 // ─── Run state (materialized from the journal by state.ts) ──────────────────
@@ -23,6 +24,7 @@ export type V3NodeStatus =
   | 'gateWaiting'  // humanGate dispatched, awaiting human resolution
   | 'running'      // worker dispatched, in flight
   | 'done'         // succeeded (work + manifest validated)
+  | 'skipped'      // triggerRule unsatisfied; acceptable terminal if a sink still reaches done
   | 'blocked'      // semantic/contract failure — recoverable via retry (new attempt)
   | 'failed';      // infrastructure failure / gate rejected / timed out — needs intervention
 
@@ -65,15 +67,32 @@ export interface V3LoopState {
 /** loopId → loop state. */
 export type V3LoopRunState = Map<string, V3LoopState>;
 
+export interface V3EdgeState {
+  active: boolean;
+  sourceAttemptId: string;
+}
+
+/** `${from}->${to}` → conditional edge state. */
+export type V3EdgeRunState = Map<string, V3EdgeState>;
+
+export interface V3OmittedInput {
+  from: string;
+  reason: 'edgeInactive' | 'sourceSkipped';
+}
+
 // ─── Actions (runtime translates each into journal writes + side effects) ───
 
 export type V3Action =
+  /** Read one source result.json once and append edgeResolved. */
+  | { kind: 'resolveEdge'; from: string; to: string }
+  /** Mark a node skipped because its triggerRule cannot be satisfied. */
+  | { kind: 'skipNode'; nodeId: string; detail?: string }
   /** Post the humanGate approval card + persist a `waits/<id>.json` (Q10). */
   | { kind: 'dispatchGate'; nodeId: string }
   /** Spawn an ephemeral worker via `runNode` for this node's goal.  `loop` is
    *  set for body-instance dispatches (the runtime synthesizes the instance
    *  node from the loop's body definition). */
-  | { kind: 'dispatchWork'; nodeId: string; loop?: V3LoopRef }
+  | { kind: 'dispatchWork'; nodeId: string; loop?: V3LoopRef; omitted?: V3OmittedInput[] }
   // ── loop control (the runtime translates each into ONE journal append) ──
   /** Outer deps of a loop are done → append loopStarted. */
   | { kind: 'startLoop'; loopId: string }
@@ -89,7 +108,7 @@ export type V3Action =
   /** Terminal: every node done; the run's product is the sink set. */
   | { kind: 'completeRunSucceeded' }
   /** Terminal (fail-fast): a node failed, so the run cannot proceed. */
-  | { kind: 'completeRunFailed'; failedNodeId: string }
+  | { kind: 'completeRunFailed'; failedNodeId?: string; reason?: V3RunFailureReason }
   /** Terminal-for-now: a node is blocked (contract failure, recoverable).
    *  Halts dispatch like failed, but the run can resume via a retry event. */
   | { kind: 'completeRunBlocked'; blockedNodeId: string };
@@ -111,6 +130,7 @@ export function decideNext(
   dag: V3Dag,
   state: V3RunState,
   loops: V3LoopRunState = new Map(),
+  edges: V3EdgeRunState = new Map(),
 ): V3Action[] {
   const order = topologicalOrder(dag);
   const nodes = new Map(dag.nodes.map((n) => [n.id, n]));
@@ -145,17 +165,24 @@ export function decideNext(
     const node = nodes.get(id)!;
     const s = st(state, id);
 
-    if (s.status === 'done') continue;
+    if (s.status === 'done' || s.status === 'skipped') continue;
 
     if (isLoopNode(node)) {
       pending++;
       const ls = loops.get(id);
       if (!ls) {
-        // Not started: like a plain node, wait for outer deps.
-        // NOTE(edge-activation): `.from`-only gating — `when` predicates and
-        // triggerRule are engine-layer work (design §5), landing next.
-        const depsOk = node.depends.every((dep) => st(state, dep.from).status === 'done');
-        if (depsOk) actions.push({ kind: 'startLoop', loopId: id });
+        const readiness = readinessFor(node, state, edges);
+        if (readiness.kind === 'wait') continue;
+        if (readiness.kind === 'resolveEdge') {
+          actions.push({ kind: 'resolveEdge', from: readiness.from, to: id });
+          continue;
+        }
+        if (readiness.kind === 'skip') {
+          actions.push({ kind: 'skipNode', nodeId: id, detail: readiness.detail });
+          continue;
+        }
+        // Not started: deps/trigger satisfied, start the composite node.
+        actions.push({ kind: 'startLoop', loopId: id });
         continue;
       }
       if (ls.iteration === 0) {
@@ -213,22 +240,98 @@ export function decideNext(
 
     // s.status === 'pending'
     pending++;
-    // NOTE(edge-activation): `.from`-only gating — `when` predicates and
-    // triggerRule are engine-layer work (design §5), landing next.
-    const depsOk = node.depends.every((dep) => st(state, dep.from).status === 'done');
-    if (!depsOk) continue;
+    const readiness = readinessFor(node, state, edges);
+    if (readiness.kind === 'wait') continue;
+    if (readiness.kind === 'resolveEdge') {
+      actions.push({ kind: 'resolveEdge', from: readiness.from, to: id });
+      continue;
+    }
+    if (readiness.kind === 'skip') {
+      actions.push({ kind: 'skipNode', nodeId: id, detail: readiness.detail });
+      continue;
+    }
 
     if (node.humanGate && !s.gateCleared) {
       actions.push({ kind: 'dispatchGate', nodeId: id });
       continue;
     }
-    actions.push({ kind: 'dispatchWork', nodeId: id });
+    actions.push(
+      readiness.omitted
+        ? { kind: 'dispatchWork', nodeId: id, omitted: readiness.omitted }
+        : { kind: 'dispatchWork', nodeId: id },
+    );
   }
 
   if (actions.length === 0 && pending === 0) {
-    return [{ kind: 'completeRunSucceeded' }];
+    const sinks = findSinks(dag);
+    if (sinks.some((id) => st(state, id).status === 'done')) {
+      return [{ kind: 'completeRunSucceeded' }];
+    }
+    return [{ kind: 'completeRunFailed', reason: 'allSinksSkipped' }];
   }
   return actions;
+}
+
+type EdgeActivity =
+  | { kind: 'active'; from: string }
+  | { kind: 'inactive'; from: string; reason: 'edgeInactive' | 'sourceSkipped' }
+  | { kind: 'unresolved'; from: string }
+  | { kind: 'unsettled' };
+
+type NodeReadiness =
+  | { kind: 'ready'; omitted?: V3OmittedInput[] }
+  | { kind: 'skip'; detail: string }
+  | { kind: 'resolveEdge'; from: string }
+  | { kind: 'wait' };
+
+function readinessFor(node: V3Node, state: V3RunState, edges: V3EdgeRunState): NodeReadiness {
+  if (node.depends.length === 0) return { kind: 'ready' };
+  const activities = node.depends.map((dep): EdgeActivity => {
+    const source = st(state, dep.from);
+    if (source.status === 'done') {
+      if (!dep.when) return { kind: 'active', from: dep.from };
+      const edge = edges.get(edgeKey(dep.from, node.id));
+      if (!edge) return { kind: 'unresolved', from: dep.from };
+      return edge.active
+        ? { kind: 'active', from: dep.from }
+        : { kind: 'inactive', from: dep.from, reason: 'edgeInactive' };
+    }
+    if (source.status === 'skipped') return { kind: 'inactive', from: dep.from, reason: 'sourceSkipped' };
+    return { kind: 'unsettled' };
+  });
+
+  if (activities.some((a) => a.kind === 'unsettled')) return { kind: 'wait' };
+  const unresolved = activities.find((a): a is Extract<EdgeActivity, { kind: 'unresolved' }> =>
+    a.kind === 'unresolved');
+  if (unresolved) return { kind: 'resolveEdge', from: unresolved.from };
+
+  const active = activities.filter((a) => a.kind === 'active').length;
+  const triggerRule = node.triggerRule ?? 'all_success';
+  const required =
+    triggerRule === 'all_success' ? node.depends.length
+    : triggerRule === 'one_success' ? 1
+    : triggerRule.quorum;
+
+  if (active >= required) {
+    const omitted = activities
+      .filter((a): a is Extract<EdgeActivity, { kind: 'inactive' }> => a.kind === 'inactive')
+      .map((a) => ({ from: a.from, reason: a.reason }));
+    return omitted.length > 0 ? { kind: 'ready', omitted } : { kind: 'ready' };
+  }
+
+  const detail = activities
+    .map((a, idx) => {
+      const dep = node.depends[idx]!;
+      if (a.kind === 'active') return `${dep.from}:active`;
+      if (a.kind === 'inactive') return `${dep.from}:inactive(${a.reason})`;
+      return `${dep.from}:${a.kind}`;
+    })
+    .join(', ');
+  return { kind: 'skip', detail: `triggerRule=${JSON.stringify(triggerRule)} unsatisfied; ${detail}` };
+}
+
+function edgeKey(from: string, to: string): string {
+  return `${from}->${to}`;
 }
 
 /** The CURRENT iteration's expanded instance ids of a loop node (empty for

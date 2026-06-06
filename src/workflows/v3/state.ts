@@ -15,8 +15,15 @@
 
 import { writeFileSync, renameSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { StoredEvent } from './journal.js';
-import type { V3LoopRunState, V3LoopState, V3NodeState, V3NodeStatus, V3RunState } from './orchestrator.js';
+import type { StoredEvent, V3RunFailureReason } from './journal.js';
+import type {
+  V3EdgeRunState,
+  V3LoopRunState,
+  V3LoopState,
+  V3NodeState,
+  V3NodeStatus,
+  V3RunState,
+} from './orchestrator.js';
 
 export type V3RunStatus = 'running' | 'succeeded' | 'failed' | 'blocked';
 
@@ -24,6 +31,9 @@ export interface V3RunSnapshot {
   runStatus: V3RunStatus;
   /** Set once `runFailed` is observed — the node that triggered fail-fast. */
   failedNodeId?: string;
+  /** Workflow-level failure reason; ordinary node failures keep using
+   *  `failedNodeId`. */
+  failureReason?: V3RunFailureReason;
   /** Set once `runBlocked` is observed — the blocked node (cleared back to
    *  running by a subsequent `nodeRetryRequested` on replay). */
   blockedNodeId?: string;
@@ -34,6 +44,8 @@ export interface V3RunSnapshot {
   attempts: Map<string, string>;
   /** loopId → composite loop state (iteration cursor / decision / grants). */
   loops: V3LoopRunState;
+  /** `${from}->${to}` → conditional edge verdicts folded from edgeResolved. */
+  edges: V3EdgeRunState;
 }
 
 // ─── Materialize (replay) ────────────────────────────────────────────────
@@ -51,13 +63,17 @@ export interface V3RunSnapshot {
  *   gateDispatched     → gateWaiting
  *   gateResolved/ok    → pending + gateCleared (next tick dispatches work)
  *   gateResolved/no    → failed
+ *   edgeResolved       → edges[first `${from}->${to}`] (first-wins)
+ *   nodeSkipped        → skipped
  */
 export function materialize(events: StoredEvent[]): V3RunSnapshot {
   const nodes: V3RunState = new Map();
   const attempts = new Map<string, string>();
   const loops: V3LoopRunState = new Map();
+  const edges: V3EdgeRunState = new Map();
   let runStatus: V3RunStatus = 'running';
   let failedNodeId: string | undefined;
+  let failureReason: V3RunFailureReason | undefined;
   let blockedNodeId: string | undefined;
 
   const set = (id: string, status: V3NodeStatus, gateCleared?: boolean): void => {
@@ -114,12 +130,23 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
         if (e.resolution === 'approved') set(e.nodeId, 'pending', true);
         else set(e.nodeId, 'failed');
         break;
+      case 'edgeResolved': {
+        const key = `${e.from}->${e.to}`;
+        if (!edges.has(key)) {
+          edges.set(key, { active: e.active, sourceAttemptId: e.sourceAttemptId });
+        }
+        break;
+      }
+      case 'nodeSkipped':
+        set(e.nodeId, 'skipped');
+        break;
       case 'runSucceeded':
         runStatus = 'succeeded';
         break;
       case 'runFailed':
         runStatus = 'failed';
         failedNodeId = e.failedNodeId;
+        failureReason = e.reason;
         break;
       case 'runBlocked':
         runStatus = 'blocked';
@@ -165,7 +192,7 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
     }
   }
 
-  return { runStatus, failedNodeId, blockedNodeId, nodes, attempts, loops };
+  return { runStatus, failedNodeId, failureReason, blockedNodeId, nodes, attempts, loops, edges };
 }
 
 // ─── STATE checkpoint (atomic write / read) ────────────────────────────────
@@ -175,10 +202,12 @@ export function materialize(events: StoredEvent[]): V3RunSnapshot {
 interface StateFile {
   runStatus: V3RunStatus;
   failedNodeId?: string;
+  failureReason?: V3RunFailureReason;
   blockedNodeId?: string;
   nodes: Record<string, V3NodeState>;
   attempts: Record<string, string>;
   loops?: Record<string, V3LoopState>;
+  edges?: Record<string, { active: boolean; sourceAttemptId: string }>;
   updatedAt: number;
 }
 
@@ -194,10 +223,12 @@ export function writeState(statePath: string, snap: V3RunSnapshot): void {
   const file: StateFile = {
     runStatus: snap.runStatus,
     failedNodeId: snap.failedNodeId,
+    failureReason: snap.failureReason,
     blockedNodeId: snap.blockedNodeId,
     nodes: Object.fromEntries(snap.nodes),
     attempts: Object.fromEntries(snap.attempts),
     loops: snap.loops.size > 0 ? Object.fromEntries(snap.loops) : undefined,
+    edges: snap.edges.size > 0 ? Object.fromEntries(snap.edges) : undefined,
     updatedAt: Date.now(),
   };
   const tmp = `${statePath}.tmp`;
@@ -214,9 +245,11 @@ export function readState(statePath: string): V3RunSnapshot | undefined {
   return {
     runStatus: file.runStatus,
     failedNodeId: file.failedNodeId,
+    failureReason: file.failureReason,
     blockedNodeId: file.blockedNodeId,
     nodes: new Map(Object.entries(file.nodes)),
     attempts: new Map(Object.entries(file.attempts)),
     loops: new Map(Object.entries(file.loops ?? {})),
+    edges: new Map(Object.entries(file.edges ?? {})),
   };
 }

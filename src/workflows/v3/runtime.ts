@@ -333,6 +333,7 @@ export type V3RunOutcome =
       runStatus: 'succeeded' | 'failed' | 'blocked';
       failedNodeId?: string;
       blockedNodeId?: string;
+      failureReason?: 'allSinksSkipped';
       runDir: string;
     }
   | { reason: 'awaitingGate'; pendingWaits: V3PendingGate[]; runDir: string };
@@ -418,7 +419,7 @@ export async function runWorkflow(
     writeState(statePath, snap);
     if (snap.runStatus !== 'running') break;
 
-    const actions = decideNext(dag, snap.nodes, snap.loops);
+    const actions = decideNext(dag, snap.nodes, snap.loops, snap.edges);
 
     // Terminal sweep: write the run terminal event, then re-tick so the top of
     // the loop observes it and breaks (single exit path).
@@ -432,26 +433,46 @@ export async function runWorkflow(
       if (terminal.kind === 'completeRunSucceeded') {
         appendEvent(journalPath, { type: 'runSucceeded' });
       } else if (terminal.kind === 'completeRunFailed') {
-        appendEvent(journalPath, { type: 'runFailed', failedNodeId: terminal.failedNodeId });
+        appendEvent(journalPath, {
+          type: 'runFailed',
+          failedNodeId: terminal.failedNodeId,
+          reason: terminal.reason,
+        });
       } else {
         appendEvent(journalPath, { type: 'runBlocked', blockedNodeId: terminal.blockedNodeId });
       }
       continue;
     }
 
-    // Loop-control sweep: each control action is one cheap journal append (no
-    // worker involved), applied together and re-ticked — same single-exit
-    // shape as the terminal sweep.  Work dispatches in the same action list
-    // simply re-emerge next tick.
-    const loopControls = actions.filter(
-      (a): a is Extract<V3Action, { loopId: string }> =>
+    // Control sweep: each action is one cheap journal append (no worker
+    // involved), applied together and re-ticked — same single-exit shape as
+    // the terminal sweep.  Work dispatches in the same action list simply
+    // re-emerge next tick.  Edge resolution is deliberately serial/control
+    // phase (H8): no inFlight, no concurrency slot, no AbortController.
+    const controls = actions.filter(
+      (a): a is
+        | Extract<V3Action, { loopId: string }>
+        | Extract<V3Action, { kind: 'resolveEdge' | 'skipNode' }> =>
         a.kind === 'startLoop' ||
         a.kind === 'startLoopIteration' ||
         a.kind === 'evaluateLoopIteration' ||
-        a.kind === 'completeLoop',
+        a.kind === 'completeLoop' ||
+        a.kind === 'resolveEdge' ||
+        a.kind === 'skipNode',
     );
-    if (loopControls.length > 0) {
-      for (const a of loopControls) applyLoopControl(a);
+    if (controls.length > 0) {
+      const eventsForControl = readJournal(journalPath);
+      for (const a of controls) {
+        if (a.kind === 'resolveEdge') applyResolveEdge(a, eventsForControl);
+        else if (a.kind === 'skipNode') {
+          appendEvent(journalPath, {
+            type: 'nodeSkipped',
+            nodeId: a.nodeId,
+            reason: 'triggerRuleUnsatisfied',
+            detail: a.detail,
+          });
+        } else applyLoopControl(a);
+      }
       continue;
     }
 
@@ -470,7 +491,7 @@ export async function runWorkflow(
           const botSnap = botSnapshots.get(botKey)!;
           if ((botInFlight.get(botKey) ?? 0) >= perBotCap) continue;
           if ((cliInFlight.get(botSnap.cliId) ?? 0) >= perCliCap) continue;
-          startWork(node, botSnap, botKey, events, a.loop);
+          startWork(node, botSnap, botKey, events, a.loop, a.omitted);
           startedThisTick++;
         } else if (a.kind === 'dispatchGate') {
           startGate(nodesById.get(a.nodeId)!);
@@ -507,6 +528,7 @@ export async function runWorkflow(
       : finalSnap.runStatus === 'blocked' ? 'blocked'
       : 'failed',
     failedNodeId: finalSnap.failedNodeId,
+    failureReason: finalSnap.failureReason,
     blockedNodeId: finalSnap.blockedNodeId,
     runDir,
   };
@@ -519,6 +541,7 @@ export async function runWorkflow(
     botKey: string,
     events: StoredEvent[],
     loopRef?: V3LoopRef,
+    omitted?: GoalInputs['omitted'],
   ): void {
     // Attempt number derived from the journal: 001 on first dispatch, the
     // reserved nextAttemptId after a blocked retry (no hardcoded 001 — a retry
@@ -540,7 +563,7 @@ export async function runWorkflow(
     writeFileSync(goalPath, renderGoalFile(node.goal ?? '', node.resultSchema, loopCtx));
 
     const inputsPath = join(attemptDir, 'inputs.json');
-    writeFileSync(inputsPath, JSON.stringify(buildInputs(node, events, loopRef), null, 2));
+    writeFileSync(inputsPath, JSON.stringify(buildInputs(node, events, loopRef, omitted), null, 2));
 
     const manifestPath = join(attemptDir, 'manifest.json');
     const env: Record<string, string> = {
@@ -808,6 +831,60 @@ export async function runWorkflow(
     appendEvent(journalPath, {
       type: 'loopIterationDecision', loopId: a.loopId, iteration: a.iteration, decision,
       detail: `${observed} (iteration ${a.iteration}/${effectiveMax})`,
+    });
+  }
+
+  /** Resolve one conditional edge by reading the source's latest successful
+   *  result.json exactly once, then journaling the boolean verdict. */
+  function applyResolveEdge(
+    a: Extract<V3Action, { kind: 'resolveEdge' }>,
+    events: StoredEvent[],
+  ): void {
+    const target = nodesById.get(a.to);
+    const dep = target?.depends.find((d) => d.from === a.from);
+    if (!target || !dep?.when) {
+      appendEvent(journalPath, {
+        type: 'edgeResolved',
+        from: a.from,
+        to: a.to,
+        sourceAttemptId: latestAttemptIdFor(events, a.from) ?? `${a.from}/attempts/unknown`,
+        active: false,
+        detail: 'edge predicate missing at resolution time',
+      });
+      return;
+    }
+
+    const succ = [...events]
+      .reverse()
+      .find((e): e is StoredEvent & { type: 'nodeSucceeded' } =>
+        e.type === 'nodeSucceeded' && e.nodeId === a.from);
+    const sourceAttemptId = succ?.attemptId ?? `${a.from}/attempts/unknown`;
+    const key = dep.when.path.slice('result.'.length);
+    let active = false;
+    let detail = `${dep.when.path}=<unreadable>`;
+    if (succ) {
+      try {
+        const manifest = JSON.parse(readFileSync(succ.manifestPath, 'utf-8')) as Manifest;
+        const entry = manifest.files.find((f) => f.path === 'result.json');
+        if (entry) {
+          const result = JSON.parse(
+            readFileSync(join(dirname(succ.manifestPath), 'work', entry.path), 'utf-8'),
+          ) as Record<string, unknown>;
+          detail = `${dep.when.path}=${JSON.stringify(result[key])}`;
+          active = matchLoopExitWhen(dep.when, result[key]);
+        }
+      } catch {
+        // The source's resultSchema should make this unreachable; keep the run
+        // progressing deterministically and surface the anomaly in detail.
+      }
+    }
+    appendEvent(journalPath, {
+      type: 'edgeResolved',
+      from: a.from,
+      to: a.to,
+      sourceAttemptId,
+      active,
+      detail,
     });
   }
 

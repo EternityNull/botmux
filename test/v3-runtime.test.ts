@@ -71,6 +71,19 @@ function product(outputDir: string, name: string, content: string): Manifest['fi
   };
 }
 
+function jsonProduct(outputDir: string, name: string, value: unknown): Manifest['files'][number] {
+  const content = JSON.stringify(value);
+  writeFileSync(join(outputDir, name), content);
+  return {
+    name,
+    path: name,
+    kind: 'json',
+    bytes: Buffer.byteLength(content),
+    sha256: createHash('sha256').update(content).digest('hex'),
+    mime: 'application/json',
+  };
+}
+
 function writeManifest(req: Parameters<RunNode>[0], manifest: Manifest): string {
   const p = req.env[GOAL_ENV.MANIFEST_PATH]!;
   writeFileSync(p, JSON.stringify(manifest));
@@ -181,6 +194,187 @@ describe('runWorkflow — research→summarize 最小闭环', () => {
       const blocked = events.find((e) => e.type === 'nodeBlocked') as any;
       expect(blocked.nodeId).toBe('research');
       expect(blocked.errorClass).toBe('manifestInvalid');
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('runWorkflow — edge activation', () => {
+  const branchDag = (decision: 'pass' | 'fail' | 'rework') => validateDag({
+    runId: `branch-${decision}`,
+    nodes: [
+      {
+        id: 'judge',
+        type: 'goal',
+        goal: 'judge',
+        depends: [],
+        inputs: [],
+        resultSchema: {
+          type: 'object',
+          properties: { decision: { type: 'string', enum: ['pass', 'fail', 'rework'] } },
+          required: ['decision'],
+        },
+      },
+      {
+        id: 'pass',
+        type: 'goal',
+        goal: 'pass branch',
+        depends: [{ from: 'judge', when: { path: 'result.decision', equals: 'pass' } }],
+        inputs: [],
+      },
+      {
+        id: 'fail',
+        type: 'goal',
+        goal: 'fail branch',
+        depends: [{ from: 'judge', when: { path: 'result.decision', equals: 'fail' } }],
+        inputs: [],
+      },
+      {
+        id: 'merge',
+        type: 'goal',
+        goal: 'merge taken branch',
+        depends: ['pass', 'fail'],
+        triggerRule: 'one_success',
+        inputs: [{ from: 'pass' }, { from: 'fail' }],
+      },
+    ],
+  });
+
+  it('二选一分叉：edgeResolved journal → inactive branch skipped → merge receives omitted', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-edge-'));
+    try {
+      let mergeInputs: GoalInputs | undefined;
+      const runNode: RunNode = async (req) => {
+        if (req.node.id === 'judge') {
+          const result = jsonProduct(req.outputDir, 'result.json', { decision: 'pass' });
+          const manifestPath = writeManifest(req, {
+            schemaVersion: 1, status: 'ok', summary: 'decision pass', files: [result],
+          });
+          return { status: 'ok', manifestPath };
+        }
+        if (req.node.id === 'merge') {
+          mergeInputs = JSON.parse(readFileSync(req.inputsPath, 'utf-8')) as GoalInputs;
+        }
+        const file = product(req.outputDir, `${req.node.id}.md`, `# ${req.node.id}`);
+        const manifestPath = writeManifest(req, {
+          schemaVersion: 1, status: 'ok', summary: `done ${req.node.id}`, files: [file],
+        });
+        return { status: 'ok', manifestPath };
+      };
+
+      const outcome = await runWorkflow(branchDag('pass'), { runNode, validateManifest, resolveBotSnapshot }, { baseDir: base });
+
+      expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
+      const events = readJournal(join(outcome.runDir, 'journal.ndjson'));
+      const resolved = events.filter((e) => e.type === 'edgeResolved').map((e) => ({
+        from: e.from, to: e.to, active: e.active, sourceAttemptId: e.sourceAttemptId,
+      })).sort((a, b) => a.to.localeCompare(b.to));
+      expect(resolved).toEqual([
+        { from: 'judge', to: 'fail', active: false, sourceAttemptId: 'judge/attempts/001' },
+        { from: 'judge', to: 'pass', active: true, sourceAttemptId: 'judge/attempts/001' },
+      ]);
+      expect(events.some((e) => e.type === 'nodeSkipped' && e.nodeId === 'fail')).toBe(true);
+      expect(events.some((e) => e.type === 'nodeDispatched' && e.nodeId === 'fail')).toBe(false);
+      expect(events.some((e) => e.type === 'nodeSucceeded' && e.nodeId === 'merge')).toBe(true);
+      expect(mergeInputs?.inputs.map((i) => i.from)).toEqual(['pass']);
+      expect(mergeInputs?.omitted).toEqual([{ from: 'fail', reason: 'sourceSkipped' }]);
+      const mergeGoal = readFileSync(join(outcome.runDir, 'merge', 'attempts', '001', 'goal.txt'), 'utf-8');
+      expect(mergeGoal).toContain('omitted');
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('全 sink skipped → runFailed(reason=allSinksSkipped)，不伪造 failedNodeId', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-all-skipped-'));
+    try {
+      const dag = validateDag({
+        runId: 'all-skipped',
+        nodes: branchDag('rework').nodes.filter((n) => n.id !== 'merge'),
+      });
+      const runNode: RunNode = async (req) => {
+        const result = jsonProduct(req.outputDir, 'result.json', { decision: 'rework' });
+        const manifestPath = writeManifest(req, {
+          schemaVersion: 1, status: 'ok', summary: 'decision rework', files: [result],
+        });
+        return { status: 'ok', manifestPath };
+      };
+
+      const outcome = await runWorkflow(dag, { runNode, validateManifest, resolveBotSnapshot }, { baseDir: base });
+
+      expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'failed', failureReason: 'allSinksSkipped' });
+      if (outcome.reason !== 'terminal') throw new Error('expected terminal outcome');
+      expect(outcome.failedNodeId).toBeUndefined();
+      const events = readJournal(join(outcome.runDir, 'journal.ndjson'));
+      const runFailed = events.find((e) => e.type === 'runFailed');
+      expect(runFailed).toMatchObject({ type: 'runFailed', reason: 'allSinksSkipped' });
+      expect((runFailed as { failedNodeId?: string } | undefined)?.failedNodeId).toBeUndefined();
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('已 journal 的 edgeResolved 可恢复推进，不重读 source result.json', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-edge-resume-'));
+    try {
+      const dag = validateDag({
+        runId: 'resume-edge',
+        nodes: [
+          {
+            id: 'judge',
+            type: 'goal',
+            goal: 'judge',
+            depends: [],
+            inputs: [],
+            resultSchema: {
+              type: 'object',
+              properties: { decision: { type: 'string', enum: ['pass'] } },
+              required: ['decision'],
+            },
+          },
+          {
+            id: 'pass',
+            type: 'goal',
+            goal: 'pass',
+            depends: [{ from: 'judge', when: { path: 'result.decision', equals: 'pass' } }],
+            inputs: [],
+          },
+        ],
+      });
+      const runDir = join(base, dag.runId);
+      const journalPath = join(runDir, 'journal.ndjson');
+      const manifestPath = join(runDir, 'judge', 'attempts', '001', 'manifest.json');
+      appendEvent(journalPath, { type: 'runStarted', runId: dag.runId });
+      appendEvent(journalPath, {
+        type: 'nodeSucceeded',
+        nodeId: 'judge',
+        attemptId: 'judge/attempts/001',
+        manifestPath,
+      });
+      appendEvent(journalPath, {
+        type: 'edgeResolved',
+        from: 'judge',
+        to: 'pass',
+        sourceAttemptId: 'judge/attempts/001',
+        active: true,
+      });
+
+      let passRan = false;
+      const runNode: RunNode = async (req) => {
+        passRan = req.node.id === 'pass';
+        const file = product(req.outputDir, 'pass.md', '# pass');
+        const outManifest = writeManifest(req, {
+          schemaVersion: 1, status: 'ok', summary: 'pass', files: [file],
+        });
+        return { status: 'ok', manifestPath: outManifest };
+      };
+
+      const outcome = await runWorkflow(dag, { runNode, validateManifest, resolveBotSnapshot }, { baseDir: base });
+      expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
+      expect(passRan).toBe(true);
+      const events = readJournal(journalPath);
+      expect(events.filter((e) => e.type === 'edgeResolved')).toHaveLength(1);
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

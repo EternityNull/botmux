@@ -160,6 +160,169 @@ describe('decideNext', () => {
   it('findSinks 找到末端节点', () => {
     expect(findSinks(dag)).toEqual(['summarize']);
   });
+
+  it('条件边 unresolved → 先 resolveEdge，不派下游', () => {
+    const branch = validateDag({
+      runId: 'branch',
+      nodes: [
+        {
+          id: 'judge',
+          type: 'goal',
+          goal: 'judge',
+          depends: [],
+          inputs: [],
+          resultSchema: {
+            type: 'object',
+            properties: { decision: { type: 'string', enum: ['pass', 'fail'] } },
+            required: ['decision'],
+          },
+        },
+        {
+          id: 'pass',
+          type: 'goal',
+          goal: 'pass',
+          depends: [{ from: 'judge', when: { path: 'result.decision', equals: 'pass' } }],
+          inputs: [],
+        },
+      ],
+    });
+    expect(decideNext(branch, new Map([['judge', { status: 'done' }]]))).toEqual([
+      { kind: 'resolveEdge', from: 'judge', to: 'pass' },
+    ]);
+  });
+
+  it('条件分叉：active 路运行，inactive 路 skipped，并级联到 all_success sink', () => {
+    const branch = validateDag({
+      runId: 'branch',
+      nodes: [
+        {
+          id: 'judge',
+          type: 'goal',
+          goal: 'judge',
+          depends: [],
+          inputs: [],
+          resultSchema: {
+            type: 'object',
+            properties: { decision: { type: 'string', enum: ['pass', 'fail'] } },
+            required: ['decision'],
+          },
+        },
+        {
+          id: 'pass',
+          type: 'goal',
+          goal: 'pass',
+          depends: [{ from: 'judge', when: { path: 'result.decision', equals: 'pass' } }],
+          inputs: [],
+        },
+        {
+          id: 'fail',
+          type: 'goal',
+          goal: 'fail',
+          depends: [{ from: 'judge', when: { path: 'result.decision', equals: 'fail' } }],
+          inputs: [],
+        },
+        { id: 'sink', type: 'goal', goal: 'sink', depends: ['fail'], inputs: [] },
+      ],
+    });
+    const state: V3RunState = new Map([['judge', { status: 'done' }]]);
+    const edges = new Map([
+      ['judge->pass', { active: true, sourceAttemptId: 'judge/attempts/001' }],
+      ['judge->fail', { active: false, sourceAttemptId: 'judge/attempts/001' }],
+    ]);
+    expect(decideNext(branch, state, new Map(), edges)).toEqual([
+      { kind: 'skipNode', nodeId: 'fail', detail: expect.stringContaining('edgeInactive') },
+      { kind: 'dispatchWork', nodeId: 'pass' },
+    ]);
+
+    const afterSkip: V3RunState = new Map([
+      ['judge', { status: 'done' }],
+      ['pass', { status: 'done' }],
+      ['fail', { status: 'skipped' }],
+    ]);
+    expect(decideNext(branch, afterSkip, new Map(), edges)).toEqual([
+      { kind: 'skipNode', nodeId: 'sink', detail: expect.stringContaining('sourceSkipped') },
+    ]);
+  });
+
+  it('one_success / quorum 在全部入边已定后判定，并携带 omitted inputs', () => {
+    const joins = validateDag({
+      runId: 'joins',
+      nodes: [
+        { id: 'a', type: 'goal', goal: 'a', depends: [], inputs: [] },
+        { id: 'b', type: 'goal', goal: 'b', depends: [], inputs: [] },
+        { id: 'c', type: 'goal', goal: 'c', depends: [], inputs: [] },
+        {
+          id: 'any',
+          type: 'goal',
+          goal: 'any',
+          depends: ['a', 'b', 'c'],
+          triggerRule: 'one_success',
+          inputs: [{ from: 'a' }, { from: 'b' }, { from: 'c' }],
+        },
+        {
+          id: 'q',
+          type: 'goal',
+          goal: 'q',
+          depends: ['a', 'b', 'c'],
+          triggerRule: { quorum: 2 },
+          inputs: [],
+        },
+      ],
+    });
+    const oneActive: V3RunState = new Map([
+      ['a', { status: 'done' }],
+      ['b', { status: 'skipped' }],
+      ['c', { status: 'skipped' }],
+    ]);
+    expect(decideNext(joins, oneActive)).toEqual([
+      {
+        kind: 'dispatchWork',
+        nodeId: 'any',
+        omitted: [
+          { from: 'b', reason: 'sourceSkipped' },
+          { from: 'c', reason: 'sourceSkipped' },
+        ],
+      },
+      { kind: 'skipNode', nodeId: 'q', detail: expect.stringContaining('quorum') },
+    ]);
+  });
+
+  it('带 humanGate 的节点若 trigger 不满足则 skipped，不派 gate', () => {
+    const gated = validateDag({
+      runId: 'gated-skip',
+      nodes: [
+        { id: 'source', type: 'goal', goal: 's', depends: [], inputs: [] },
+        {
+          id: 'deploy',
+          type: 'goal',
+          goal: 'd',
+          depends: ['source'],
+          inputs: [],
+          humanGate: { prompt: 'approve?' },
+        },
+      ],
+    });
+    expect(decideNext(gated, new Map([['source', { status: 'skipped' }]]))).toEqual([
+      { kind: 'skipNode', nodeId: 'deploy', detail: expect.stringContaining('sourceSkipped') },
+    ]);
+  });
+
+  it('全 sink skipped → workflow-level failed，不伪造 failedNodeId', () => {
+    const branch = validateDag({
+      runId: 'all-skipped',
+      nodes: [
+        { id: 'judge', type: 'goal', goal: 'judge', depends: [], inputs: [] },
+        { id: 'a', type: 'goal', goal: 'a', depends: ['judge'], inputs: [] },
+        { id: 'b', type: 'goal', goal: 'b', depends: ['judge'], inputs: [] },
+      ],
+    });
+    const state: V3RunState = new Map([
+      ['judge', { status: 'done' }],
+      ['a', { status: 'skipped' }],
+      ['b', { status: 'skipped' }],
+    ]);
+    expect(decideNext(branch, state)).toEqual([{ kind: 'completeRunFailed', reason: 'allSinksSkipped' }]);
+  });
 });
 
 // ── journal + state 物化 ────────────────────────────────────────────────────
@@ -211,6 +374,20 @@ describe('journal + state', () => {
     expect(snap.failedNodeId).toBe('research');
   });
 
+  it('edgeResolved first-wins + nodeSkipped + allSinksSkipped failureReason', () => {
+    const snap = materialize([
+      { ts: 1, type: 'edgeResolved', from: 'judge', to: 'pass', sourceAttemptId: 'judge/attempts/001', active: true },
+      { ts: 2, type: 'edgeResolved', from: 'judge', to: 'pass', sourceAttemptId: 'judge/attempts/001', active: false },
+      { ts: 3, type: 'nodeSkipped', nodeId: 'fail', reason: 'triggerRuleUnsatisfied', detail: 'inactive' },
+      { ts: 4, type: 'runFailed', reason: 'allSinksSkipped' },
+    ]);
+    expect(snap.edges.get('judge->pass')).toEqual({ active: true, sourceAttemptId: 'judge/attempts/001' });
+    expect(snap.nodes.get('fail')!.status).toBe('skipped');
+    expect(snap.runStatus).toBe('failed');
+    expect(snap.failedNodeId).toBeUndefined();
+    expect(snap.failureReason).toBe('allSinksSkipped');
+  });
+
   it('STATE checkpoint 原子写 + 读回一致', () => {
     const dir = mkdtempSync(join(tmpdir(), 'v3-state-'));
     try {
@@ -224,6 +401,25 @@ describe('journal + state', () => {
       expect(back.runStatus).toBe('running');
       expect(back.nodes.get('research')!.status).toBe('done');
       expect(back.attempts.get('research')).toBe('research/attempts/001');
+      expect(back.edges).toEqual(new Map());
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('STATE checkpoint roundtrip preserves edges and failureReason', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'v3-state-edge-'));
+    try {
+      const sp = join(dir, 'STATE');
+      const snap = materialize([
+        { ts: 1, type: 'edgeResolved', from: 'judge', to: 'pass', sourceAttemptId: 'judge/attempts/001', active: false },
+        { ts: 2, type: 'runFailed', reason: 'allSinksSkipped' },
+      ]);
+      writeState(sp, snap);
+      const back = readState(sp)!;
+      expect(back.runStatus).toBe('failed');
+      expect(back.failureReason).toBe('allSinksSkipped');
+      expect(back.edges.get('judge->pass')).toEqual({ active: false, sourceAttemptId: 'judge/attempts/001' });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

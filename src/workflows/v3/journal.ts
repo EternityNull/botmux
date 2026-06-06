@@ -30,6 +30,8 @@ export type V3ErrorClass =
   | 'gateRejected'     // human rejected the approval gate
   | 'cancelled';       // run cancelled out from under the node
 
+export type V3RunFailureReason = 'allSinksSkipped';
+
 /**
  * The MVP event union.  Static DAG + fail-fast, so the lifecycle is small:
  * run boundaries, per-node dispatch/settle, and gate dispatch/resolve.  Retry
@@ -83,6 +85,22 @@ export type V3Event =
     }
   | { type: 'gateDispatched'; nodeId: string; waitId: string }
   | { type: 'gateResolved'; nodeId: string; waitId: string; resolution: 'approved' | 'rejected'; by: string }
+  // ── edge activation lifecycle ──
+  // Conditional edge predicates read a source node's validated result.json
+  // exactly once, then persist the verdict here.  Replay / dashboards /
+  // decideNext consume this event and never re-read result.json.
+  | {
+      type: 'edgeResolved';
+      from: string;
+      to: string;
+      sourceAttemptId: string;
+      active: boolean;
+      detail?: string;
+    }
+  // A node whose triggerRule cannot be satisfied is a terminal skipped node.
+  // It is not a failure and does not trigger fail-fast; its outgoing edges
+  // become inactive by pure derivation from node state + static DAG.
+  | { type: 'nodeSkipped'; nodeId: string; reason: 'triggerRuleUnsatisfied'; detail?: string }
   // ── structured loop lifecycle ──
   // A loop is a composite node: its body expands into REAL journal-level nodes
   // per iteration (instance ids via loopInstanceId), so dispatch/settle/retry
@@ -109,7 +127,7 @@ export type V3Event =
   // patch).  Consumed by the next loopIterationStarted.
   | { type: 'loopIterationGranted'; loopId: string; fromIteration: number; by?: string }
   | { type: 'runSucceeded' }
-  | { type: 'runFailed'; failedNodeId: string }
+  | { type: 'runFailed'; failedNodeId?: string; reason?: V3RunFailureReason }
   // Terminal-for-now: every non-done path is blocked (recoverable).  A retry
   // clears it back to running on replay (see state.ts materialize).
   | { type: 'runBlocked'; blockedNodeId: string };
