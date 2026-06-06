@@ -16,6 +16,8 @@ import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
 import * as messageQueue from './services/message-queue.js';
+import { emitHookEvent, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
+import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
 import { parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
@@ -359,6 +361,11 @@ async function sessionReply(anchor: string, content: string, msgType: string = '
   }
   const appId = larkAppId ?? ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
   if (!appId) throw new Error('No bot configured');
+  const hookContext = ds ? {
+    sessionId: ds.session.sessionId,
+    scope: ds.scope,
+    anchor: sessionAnchorId(ds),
+  } : undefined;
 
   // Chat-scope: post a plain message to the chat. No reply_in_thread → keeps
   // the conversation flat in 普通群. The card layer carries chatId in its button
@@ -380,20 +387,20 @@ async function sessionReply(anchor: string, content: string, msgType: string = '
       const fresh = readSessionFreshFromDisk(ds.session.sessionId, ds.larkAppId);
       if (fresh) syncReplyTargetState(ds, fresh);
       const target = resolveSessionReplyTarget(ds, turnId);
-      if (target.mode === 'thread') return replyMessage(appId, target.rootMessageId, content, msgType, true);
+      if (target.mode === 'thread') return replyMessage(appId, target.rootMessageId, content, msgType, true, undefined, hookContext);
       if (ds.session.rootMessageId) {
         const mode = await getChatMode(appId, chatId, { forceRefresh: true });
         if (mode === 'topic') {
           logger.warn(`[routing] Chat-scope session ${ds.session.sessionId.substring(0, 8)} is now topic-mode; replying in original thread ${ds.session.rootMessageId.substring(0, 12)}`);
-          return replyMessage(appId, ds.session.rootMessageId, content, msgType, true);
+          return replyMessage(appId, ds.session.rootMessageId, content, msgType, true, undefined, hookContext);
         }
       }
     }
-    return sendMessage(appId, chatId, content, msgType);
+    return sendMessage(appId, chatId, content, msgType, undefined, hookContext);
   }
 
   // Thread-scope (or unknown / legacy): reply in thread.
-  return replyMessage(appId, anchor, content, msgType, true);
+  return replyMessage(appId, anchor, content, msgType, true, undefined, hookContext);
 }
 
 async function revokeQuotaGrant(
@@ -1734,6 +1741,33 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   return jsonRes(res, 200, result);
 });
 
+// ─── hooks emit 转发端点 ────────────────────────────────────────────────────
+// CLI side（botmux send 等）调用 emitHookEvent 时，把事件转发到 daemon 这条
+// 接口；daemon 在自己的长寿命事件循环里负责 spawn hook、跑 timeout、超时杀
+// 整个进程组。短命 CLI 进程的 timer.unref 会让超时承诺失效、跑飞的 hook 留
+// 孤儿，让 daemon 接管根治这一缺口。daemon 进程自身不带 BOTMUX_SESSION_ID
+// 环境变量，所以这里调 emitHookEvent 不会再触发转发回退（无递归）。
+ipcRoute('POST', '/api/hooks/emit', async (req, res) => {
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!raw || typeof raw !== 'object') {
+    return jsonRes(res, 400, { ok: false, error: 'bad_body' });
+  }
+  const { event, payload } = raw as { event?: unknown; payload?: unknown };
+  if (typeof event !== 'string' || !(HOOK_EVENTS as readonly string[]).includes(event)) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_event' });
+  }
+  if (!payload || typeof payload !== 'object') {
+    return jsonRes(res, 400, { ok: false, error: 'bad_payload' });
+  }
+  emitHookEvent(event as HookEvent, payload as Record<string, unknown>);
+  return jsonRes(res, 202, { ok: true });
+});
+
 // ─── adopt-session 查询端点 ───────────────────────────────────────────────────
 // CLI side（botmux hook）通过祖先 PID 匹配 adopt 会话，路由 askUserQuestion。
 // GET /api/adopt-session/:pid — 返回该 pid 对应的 adopt 会话路由信息。
@@ -1928,6 +1962,18 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const senderUnionId: string | undefined = data.sender?.sender_id?.union_id;
   const botCfg = getBot(larkAppId).config;
   logger.info(`New session: "${content.substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)}, resources: ${resources.length}, active: ${getActiveCount()}, messageId: ${messageId}, chatId: ${chatId})`);
+  emitHookEvent('topic.new', {
+    larkAppId,
+    chatId,
+    chatType,
+    scope,
+    anchor,
+    messageId,
+    senderOpenId,
+    senderType: parsed.senderType,
+    msgType: parsed.msgType,
+    content,
+  });
 
   if (parseWorkflowCommand(cmdContent)) {
     if (await replyGrantRestrictionIfNeeded(larkAppId, chatId, senderOpenId, anchor, '/workflow')) {
@@ -2432,6 +2478,22 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     : '';
 
   const promptContent = buildQuoteHint(parsed, scope, anchor) + botSenderPrefix + parsed.content;
+  const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
+  emitHookEvent('thread.reply', {
+    larkAppId,
+    chatId: ctxChatId,
+    chatType: ctxChatType,
+    scope,
+    anchor,
+    messageId: parsed.messageId,
+    rootId: parsed.rootId,
+    parentId: parsed.parentId,
+    senderOpenId: senderOpenIdForPrefix,
+    senderType: parsed.senderType,
+    msgType: parsed.msgType,
+    sessionId: existingHookSession?.session.sessionId,
+    content: parsed.content,
+  });
   if (isForeignBot) {
     logger.info(
       `[${larkAppId}] foreign-bot @mention prefix attached: sender=${senderOpenIdForPrefix?.substring(0, 12)} ` +
@@ -3199,6 +3261,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    setSessionLifecycleShutdown(true);
     logger.info(`Daemon shutting down... (active: ${getActiveCount()})`);
     scheduler.stopScheduler();
     for (const watcher of workflowEventWatchers.values()) watcher.close();

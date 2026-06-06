@@ -52,6 +52,7 @@ import { createCliAdapterSync } from './adapters/cli/registry.js';
 import { logger } from './utils/logger.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
+import { dispatchPrimaryMessage } from './cli/send-dispatch.js';
 import {
   formatBotInfoEntriesForCli,
   formatChatBotsForCli,
@@ -3034,13 +3035,20 @@ async function cmdSend(rest: string[]): Promise<void> {
   // addressing to go to the last caller in the shared oncall workspace.
   const oncallEntry = !sendTopLevel && !overrideChatId && !sendInto && s.chatId
     ? findOncallChatForAnyBot(s.chatId) : undefined;
+
+  const hookContext = {
+    sessionId: sid,
+    chatId: s.chatId,
+    rootMessageId: s.rootMessageId,
+    title: s.title,
+  };
   // Dispatch helper: top-level / chat-scope send vs reply-in-thread, single
   // decision point. Used for file attachments (always plain in chat scope).
   const sendTarget = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: s.currentReplyTarget?.rootMessageId, replyTargetTurnId: s.currentReplyTarget?.turnId, currentTurnId });
   const dispatch = (content: string, msgType: string): Promise<string> =>
     sendTarget.mode === 'plain'
-      ? sendMessage(appId, sendTarget.chatId, content, msgType)
-      : replyMessage(appId, sendTarget.rootMessageId, content, msgType, true);
+      ? sendMessage(appId, sendTarget.chatId, content, msgType, undefined, hookContext)
+      : replyMessage(appId, sendTarget.rootMessageId, content, msgType, true, undefined, hookContext);
   const recordBridgeSendMarker = (sentAtMs: number, messageId: string, sentContent: string): void => {
     try {
       const markerDir = join(resolveDataDir(), 'turn-sends');
@@ -3108,20 +3116,24 @@ async function cmdSend(rest: string[]): Promise<void> {
   });
   let primaryQuotedId: string | null = null;
   const dispatchPrimary = async (content: string, msgType: string): Promise<string> => {
-    if (quoteTargetId) {
-      try {
-        const id = await replyMessage(appId, quoteTargetId, content, msgType, false);
-        primaryQuotedId = quoteTargetId;
-        return id;
-      } catch (err: any) {
-        if (err instanceof MessageWithdrawnError) {
-          console.error(`引用目标 ${quoteTargetId} 已撤回，改为普通发送`);
-          return sendMessage(appId, targetChatId, content, msgType);
-        }
-        throw err;
-      }
-    }
-    return dispatch(content, msgType);
+    const result = await dispatchPrimaryMessage(
+      { sendMessage, replyMessage },
+      {
+        appId,
+        targetChatId,
+        quoteTargetId,
+        content,
+        msgType,
+        hookContext,
+        MessageWithdrawnError,
+        dispatch,
+        onQuoteWithdrawn: (id) => {
+          console.error(`引用目标 ${id} 已撤回，改为普通发送`);
+        },
+      },
+    );
+    primaryQuotedId = result.primaryQuotedId;
+    return result.messageId;
   };
 
   try {

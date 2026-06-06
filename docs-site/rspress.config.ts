@@ -108,6 +108,10 @@ export default defineConfig({
                         "link": "/schedule"
                   },
                   {
+                        "text": "Lifecycle Hooks",
+                        "link": "/hooks"
+                  },
+                  {
                         "text": "Oncall 模式",
                         "link": "/oncall"
                   },
