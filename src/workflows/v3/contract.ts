@@ -130,13 +130,13 @@ export const GOAL_ENV = {
 
 /**
  * A goal worker that needs a human decision mid-run does NOT block in-process.
- * Instead it writes its question + options to `GOAL_ASK_FILE` under the attempt
+ * Instead it writes its question to `GOAL_ASK_FILE` under the attempt
  * dir, then exits with a fail manifest carrying `error.code = ASK_HUMAN_ERROR_CODE`
  * and `error.retryable: true`.  classifyTerminal routes that to `blocked` (the
  * retryable half), and the daemon posts an ask card instead of a plain retry
  * card.  When the human answers, the daemon writes `GOAL_ANSWER_FILE` next to the
  * ask and re-dispatches the node; the next attempt's GoalInputs injects the
- * answer as a `human/answer` input.  No suspend machinery, no held worker — it
+ * answer as `{from:'human', name:'answer'}`.  No suspend machinery, no held worker — it
  * is the ordinary blocked→retry lifecycle with question/answer payloads bolted
  * onto the two journal events.
  */
@@ -150,19 +150,35 @@ export const GOAL_ASK_FILE = 'ask.json';
  *  human's {@link GoalAnswer} to; the retry's GoalInputs points at this path. */
 export const GOAL_ANSWER_FILE = 'answer.json';
 
-export interface GoalAsk {
-  /** The single question to put to the human. */
-  question: string;
-  /** 2–6 concrete options the human picks from; each becomes a card button. */
-  options: string[];
-}
+export type GoalAsk =
+  | {
+      /** The single question to put to the human. */
+      question: string;
+      /** 2–6 concrete options the human picks from; each becomes a card button. */
+      options: string[];
+      freeText?: false;
+    }
+  | {
+      /** The single question to put to the human. */
+      question: string;
+      /** Ask the human to provide free-form text instead of picking an option. */
+      freeText: true;
+      options?: never;
+    };
 
-export interface GoalAnswer {
-  /** The option the human selected (one of {@link GoalAsk.options}). */
-  selected: string;
-  /** open_id of the human who answered. */
-  by: string;
-}
+export type GoalAnswer =
+  | {
+      /** The option the human selected (one of {@link GoalAsk.options}). */
+      selected: string;
+      /** open_id of the human who answered. */
+      by: string;
+    }
+  | {
+      /** Free-form text the human provided. */
+      text: string;
+      /** open_id of the human who answered. */
+      by: string;
+    };
 
 // ─── Supported CLIs ─────────────────────────────────────────────────────────
 

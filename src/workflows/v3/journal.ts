@@ -16,6 +16,7 @@
 
 import { appendFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import type { GoalAsk } from './contract.js';
 
 // ─── Event taxonomy ─────────────────────────────────────────────────────────
 
@@ -52,27 +53,38 @@ export interface V3LoopRef {
 
 export type V3Event =
   | { type: 'runStarted'; runId: string }
-  | { type: 'nodeDispatched'; nodeId: string; attemptId: string; loop?: V3LoopRef }
+  // `instanceId` (`A#001`) identifies the RUNTIME instance of definition node
+  // `nodeId`.  A cross-node revisit supersedes an instance and the node gets a
+  // fresh one (`A#002`); `attemptId` is a try WITHIN an instance
+  // (`A#001/attempts/002`, from a blocked / human-ask retry).  Optional for
+  // back-compat: pre-instance-layer events and loop body expansions (which
+  // carry their own expanded nodeId) omit it, and consumers fall back to
+  // nodeId-keyed behavior (instance restoration design 2026-06-08).
+  | { type: 'nodeDispatched'; nodeId: string; instanceId?: string; attemptId: string; loop?: V3LoopRef }
   // Written when the node's worker web terminal is ready (mid-run) so the
   // dashboard can attach to an in-flight node's LIVE terminal instead of waiting
   // for completion.  Kept even if the node later fails (terminal info survives).
   // NOTE: deliberately NO web-terminal `token` here — it's a WRITE token, and
   // read-only "watch the subagent" doesn't need it; persisting it would turn
   // write access into a durable artifact (codex security review 2026-06-02).
-  | { type: 'nodeSessionReady'; nodeId: string; attemptId: string; sessionInfo: { sessionId: string; webPort?: number }; ptyLogPath?: string }
-  | { type: 'nodeSucceeded'; nodeId: string; attemptId: string; manifestPath: string }
+  | { type: 'nodeSessionReady'; nodeId: string; instanceId?: string; attemptId: string; sessionInfo: { sessionId: string; webPort?: number }; ptyLogPath?: string }
+  | { type: 'nodeSucceeded'; nodeId: string; instanceId?: string; attemptId: string; manifestPath: string }
   // `errorCode` carries the node's self-reported `manifest.error.code` (e.g.
   // AUTH_REQUIRED) so dashboards see the real cause, not just the coarse class.
-  | { type: 'nodeFailed'; nodeId: string; attemptId: string; errorClass: V3ErrorClass; errorCode?: string; message?: string }
+  | { type: 'nodeFailed'; nodeId: string; instanceId?: string; attemptId: string; errorClass: V3ErrorClass; errorCode?: string; message?: string }
   // Semantic/contract failure — recoverable.  classifyTerminal(errorClass,
   // retryable) decides blocked-vs-failed; blocked halts the run like failed
   // but is retryable via `nodeRetryRequested` (journal event, NOT in-memory).
   // `ask` is present ONLY when the block is a runtime human-ask (errorCode ===
-  // ASK_HUMAN_ERROR_CODE): the goal worker's question + options, read from the
-  // attempt's ask.json.  The daemon renders an ask card (question + option
-  // buttons) instead of a plain retry card; everything else is identical to a
-  // contract-failure block.
-  | { type: 'nodeBlocked'; nodeId: string; attemptId: string; errorClass: V3ErrorClass; errorCode?: string; message?: string; ask?: { question: string; options: string[] } }
+  // ASK_HUMAN_ERROR_CODE): the goal worker's question, read from the attempt's
+  // ask.json.  The daemon renders an ask card instead of a plain retry card;
+  // everything else is identical to a contract-failure block.
+  | { type: 'nodeBlocked'; nodeId: string; instanceId?: string; attemptId: string; errorClass: V3ErrorClass; errorCode?: string; message?: string; ask?: GoalAsk;
+      // Set only when errorCode === 'REVISIT_BUDGET_EXHAUSTED': the ancestor this
+      // node tried to revisit.  The grant card reads it to label the source→target
+      // pair + pick the grant scope (the revisit was budget-blocked before any
+      // nodeRevisitRequested was journaled, so the target isn't recorded elsewhere).
+      revisitTo?: string }
   // Retry intent for a blocked node.  Appended by the retry entrypoint (CLI /
   // daemon card click).  materialize() resets the node to pending and records
   // `nextAttemptId` as the attempt reservation; the orchestrator then re-
@@ -82,28 +94,41 @@ export type V3Event =
   | {
       type: 'nodeRetryRequested';
       nodeId: string;
+      // The instance being retried.  A blocked / human-ask retry stays in the
+      // SAME instance — `previousAttemptId`/`nextAttemptId` are attempts under
+      // this `instanceId` (`A#001/attempts/002`).  This is NOT a revisit: a
+      // revisit makes a NEW instance via nodeInstanceSuperseded + re-dispatch.
+      instanceId?: string;
       previousAttemptId: string;
       nextAttemptId: string;
       reason: 'blockedRetry';
       previousErrorClass?: V3ErrorClass;
       previousErrorCode?: string;
       // Present ONLY when the retry answers a runtime human-ask: the human's
-      // selected option, persisted to `answer.path` (an absolute path, next to
+      // selected option or free-text answer, persisted to `answer.path` (an absolute path, next to
       // the asked attempt).  buildInputs injects it into the retry attempt's
-      // GoalInputs as a `human/answer` input so the agent reads the decision and
+      // GoalInputs as `{from:"human", name:"answer"}` so the agent reads the decision and
       // continues.  Absent for an ordinary blocked retry.
       answer?: { path: string; preview: string; by: string };
     }
-  | { type: 'gateDispatched'; nodeId: string; waitId: string }
-  | { type: 'gateResolved'; nodeId: string; waitId: string; resolution: 'approved' | 'rejected'; by: string; selected?: string }
+  // Gate is per-INSTANCE: `A#001`'s approval must not clear `A#002` after a
+  // revisit (constraint 6).  `instanceId` optional for back-compat.
+  | { type: 'gateDispatched'; nodeId: string; instanceId?: string; waitId: string }
+  | { type: 'gateResolved'; nodeId: string; instanceId?: string; waitId: string; resolution: 'approved' | 'rejected'; by: string; selected?: string }
   // ── edge activation lifecycle ──
   // Conditional edge predicates read a source node's validated result.json
   // exactly once, then persist the verdict here.  Replay / dashboards /
   // decideNext consume this event and never re-read result.json.
+  // `fromInstanceId`/`toInstanceId` scope the verdict to a concrete instance
+  // pair so a revisit's `A#001->B#001` verdict never bleeds onto the fresh
+  // `A#002->B#002` edge (constraint 1).  `from`/`to` stay as definition-layer
+  // labels for the dashboard; both optional for back-compat.
   | {
       type: 'edgeResolved';
       from: string;
       to: string;
+      fromInstanceId?: string;
+      toInstanceId?: string;
       sourceAttemptId: string;
       active: boolean;
       detail?: string;
@@ -118,10 +143,60 @@ export type V3Event =
   | {
       type: 'nodeCancelled';
       nodeId: string;
+      instanceId?: string;
       attemptId?: string;
       reason: 'earlyReleaseLoser';
       byNodeId: string;
       detail?: string;
+    }
+  // ── cross-node revisit / instance lifecycle (instance restoration 2026-06-08) ──
+  // A node's worker emitted result.json `status:"revisit"` requesting a jump
+  // back to ancestor `toNodeId` (must be in the node's `revisitTo`).  Audit +
+  // the trigger for the supersede sweep the runtime appends next.  `reason` is
+  // the worker's free-text "why" (the cross-node analogue of a block reason).
+  | {
+      type: 'nodeRevisitRequested';
+      nodeId: string;
+      instanceId: string;
+      attemptId: string;
+      toNodeId: string;
+      reason?: string;
+      // Feedback paths (runDir-relative) the target's fresh instance reads via
+      // `from:"revisit"` inputs — so it knows WHY it was sent back, WHAT the
+      // downstream found, and WHAT it itself produced last time, instead of
+      // re-running blind.  reasonPath: the reason text file (runtime-written);
+      // sourceManifestPath: the requesting node's manifest (its products are the
+      // "where it went wrong" evidence); targetPreviousManifestPath: the target's
+      // own prior (now-superseded) manifest (so it edits, not rewrites).
+      reasonPath?: string;
+      sourceManifestPath?: string;
+      targetPreviousManifestPath?: string;
+    }
+  // The revisit invalidates a runtime instance: the target's current effective
+  // instance AND every already-materialized instance in its downstream cone are
+  // superseded (marked, never deleted — files stay for audit + as the
+  // `targetPreviousManifestPath` snapshot).  `byNodeId` = the revisit target
+  // that triggered the refresh.  materialize sets the instance `superseded` and
+  // recomputes the node's `effectiveInstanceId`, so decideNext re-dispatches a
+  // fresh `#NNN`.  This is the "refresh" the dashboard shows on those nodes.
+  | {
+      type: 'nodeInstanceSuperseded';
+      nodeId: string;
+      instanceId: string;
+      byNodeId: string;
+      reason: 'refresh';
+    }
+  // A human granted extra revisit budget after the run blocked on exhaustion
+  // (the revisit analogue of loopIterationGranted).  A PAIR grant (both
+  // sourceNodeId + toNodeId set) bumps one source→target edge's allowance by 1;
+  // a RUN grant (neither set) bumps the run-wide allowance by 1.  Consumed by
+  // the next budget check in the runtime's revisit recognition.
+  | {
+      type: 'revisitBudgetGranted';
+      sourceNodeId?: string;
+      toNodeId?: string;
+      by: string;
+      reason?: string;
     }
   // ── structured loop lifecycle ──
   // A loop is a composite node: its body expands into REAL journal-level nodes

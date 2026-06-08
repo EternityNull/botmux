@@ -171,6 +171,17 @@ export const RESULT_ENUM_MAX_VALUE_LENGTH = 64;
  *  extra iterations one at a time once the loop blocks. */
 export const MAX_LOOP_ITERATIONS = 20;
 
+/** Cross-node revisit budgets (anti-infinite-loop).  Two tiers:
+ *  - PER-PAIR (source→target): how many times one node may revisit one ancestor
+ *    before the run blocks — default 1 (a node sends each ancestor back once;
+ *    expected multi-round rework belongs in a structured loop, not ad-hoc
+ *    revisit).  Pinpoints which edge is ping-ponging.
+ *  - PER-RUN: total revisits across the whole run — a generous backstop so many
+ *    distinct pairs (or many nodes revisiting) can't run away.
+ *  Exhaustion blocks the run; a human grants +1 (revisitBudgetGranted). */
+export const DEFAULT_REVISIT_BUDGET_PER_PAIR = 1;
+export const DEFAULT_REVISIT_BUDGET_PER_RUN = 8;
+
 // ─── Loop schema ─────────────────────────────────────────────────────────
 
 /**
@@ -244,6 +255,13 @@ export interface V3Node {
    *  `result.json` (listed in its manifest files) matching this schema; a
    *  violation blocks (not fails) the node.  Absent → zero behavior change. */
   resultSchema?: V3ResultSchema;
+  /** Definition-level revisit exits (cross-node回溯).  When this node's
+   *  `result.json` returns `{ "status": "revisit", "revisitTo": "<A>" }`, the
+   *  runtime may revisit ancestor node `<A>` — but ONLY if `<A>` is listed
+   *  here.  Default (absent / empty) = the node cannot revisit anything.
+   *  validateDag enforces every entry is an ANCESTOR (transitive `depends`),
+   *  so a revisit can never create a forward jump or a cycle in the run. */
+  revisitTo?: string[];
 
   // ── loop-only fields (type === 'loop'; see V3LoopNode) ──
   /** Hard iteration bound; the loop blocks (recoverable, human can grant +1)
@@ -429,6 +447,8 @@ export function validateDag(raw: unknown): V3Dag {
 
     const override = normOverride(n.override, `node "${id}"`, problems);
 
+    const revisitTo = normRevisitTo(n.revisitTo, id, problems);
+
     nodes.push({
       id,
       type,
@@ -441,6 +461,7 @@ export function validateDag(raw: unknown): V3Dag {
       timeoutSec,
       humanGate,
       resultSchema,
+      ...(revisitTo ? { revisitTo } : {}),
     });
   }
 
@@ -454,6 +475,23 @@ export function validateDag(raw: unknown): V3Dag {
         problems.push(`node "${node.id}".inputs references unknown node "${inp.from}"`);
       } else if (!node.depends.some((d) => d.from === inp.from)) {
         problems.push(`node "${node.id}".inputs.from "${inp.from}" must also be in depends`);
+      }
+    }
+    // revisitTo: each target must exist AND be a (transitive) ANCESTOR of this
+    // node — a revisit only ever jumps BACKWARD, so the definition graph stays
+    // acyclic and the supersede cone is well-defined (cross-node回溯 design).
+    if (node.revisitTo && node.revisitTo.length > 0) {
+      const ancestors = ancestorsOf(node.id, nodes);
+      for (const target of node.revisitTo) {
+        if (!ids.has(target)) {
+          problems.push(`node "${node.id}".revisitTo references unknown node "${target}"`);
+        } else if (target === node.id) {
+          problems.push(`node "${node.id}".revisitTo cannot point at itself`);
+        } else if (!ancestors.has(target)) {
+          problems.push(
+            `node "${node.id}".revisitTo "${target}" must be an ancestor (reachable via depends) — revisit only jumps backward`,
+          );
+        }
       }
     }
   }
@@ -782,6 +820,44 @@ function normTimeoutSec(v: unknown, where: string, problems: string[]): number |
     return undefined;
   }
   return v;
+}
+
+/** Normalize `revisitTo`: an optional array of non-empty path-safe node ids.
+ *  Shape only here; the ancestor / existence cross-checks run once all ids are
+ *  collected (validateDag's cross-node pass). */
+function normRevisitTo(v: unknown, id: string, problems: string[]): string[] | undefined {
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v)) {
+    problems.push(`node "${id}".revisitTo must be an array of node ids`);
+    return undefined;
+  }
+  const out: string[] = [];
+  for (const entry of v) {
+    if (typeof entry !== 'string' || entry.trim() === '') {
+      problems.push(`node "${id}".revisitTo entries must be non-empty node-id strings`);
+      continue;
+    }
+    out.push(entry);
+  }
+  if (new Set(out).size !== out.length) problems.push(`node "${id}".revisitTo has duplicates`);
+  return out.length > 0 ? out : undefined;
+}
+
+/** Transitive ancestors of `nodeId` over `depends` edges (the set of nodes
+ *  from which `nodeId` is reachable downstream).  Used to constrain
+ *  `revisitTo` to backward-only jumps.  Pure BFS over the (acyclic-by-design)
+ *  definition graph. */
+function ancestorsOf(nodeId: string, nodes: V3Node[]): Set<string> {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const seen = new Set<string>();
+  const queue = [...(byId.get(nodeId)?.depends.map((d) => d.from) ?? [])];
+  while (queue.length > 0) {
+    const cur = queue.shift()!;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    for (const dep of byId.get(cur)?.depends ?? []) queue.push(dep.from);
+  }
+  return seen;
 }
 
 /**

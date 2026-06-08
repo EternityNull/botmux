@@ -32,6 +32,10 @@ export type GateWaitStatus = 'pending' | 'approved' | 'rejected';
 export interface GateWait {
   waitId: string;
   nodeId: string;
+  /** The runtime instance this gate belongs to (`A#001`).  A revisit makes a
+   *  fresh instance + fresh gate; resolve-time validation rejects a stale card
+   *  whose instance is no longer the node's effective one (code review). */
+  instanceId?: string;
   prompt: string;
   options: string[];
   approveOptions: string[];
@@ -72,13 +76,14 @@ function atomicWriteJson(path: string, value: unknown): void {
 export function writePendingWait(
   runDir: string,
   input: { waitId: string; nodeId: string; prompt: string } &
-    Partial<Pick<GateWait, 'options' | 'approveOptions' | 'approvers'>>,
+    Partial<Pick<GateWait, 'options' | 'approveOptions' | 'approvers' | 'instanceId'>>,
 ): GateWait {
   const options = input.options ?? [...DEFAULT_HUMAN_GATE_OPTIONS];
   const approveOptions = input.approveOptions ?? (options.includes('approve') ? ['approve'] : [options[0]!]);
   const wait: GateWait = {
     waitId: input.waitId,
     nodeId: input.nodeId,
+    ...(input.instanceId ? { instanceId: input.instanceId } : {}),
     prompt: input.prompt,
     options,
     approveOptions,
@@ -158,6 +163,7 @@ function normalizeWaitFile(raw: Partial<GateWait>): GateWait {
   return {
     waitId: raw.waitId ?? '',
     nodeId: raw.nodeId ?? '',
+    ...(raw.instanceId ? { instanceId: raw.instanceId } : {}),
     prompt: raw.prompt ?? '',
     options,
     approveOptions: raw.approveOptions ?? (options.includes('approve') ? ['approve'] : [options[0]!]),

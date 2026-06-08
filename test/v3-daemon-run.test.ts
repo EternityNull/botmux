@@ -75,12 +75,12 @@ describe('driveV3Run — suspend gate → 发卡 → 点击 redrive', () => {
       expect(postGateCard).toHaveBeenCalledTimes(1);
       const [binding, gate, runId] = postGateCard.mock.calls[0]!;
       expect(binding).toEqual(BINDING);
-      expect(gate).toMatchObject({ nodeId: 'deploy', waitId: 'deploy-gate', prompt: '批准部署？' });
+      expect(gate).toMatchObject({ nodeId: 'deploy', waitId: 'deploy#001-gate', prompt: '批准部署？' });
       expect(runId).toBe('gate-run');
       expect(onTerminal).not.toHaveBeenCalled();
       expect(runNodeCalls()).toBe(0);
       // wait file 已被 runtime 写出（pending）
-      expect(readWait(runDir, 'deploy-gate')?.status).toBe('pending');
+      expect(readWait(runDir, 'deploy#001-gate')?.status).toBe('pending');
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
@@ -95,9 +95,9 @@ describe('driveV3Run — suspend gate → 发卡 → 点击 redrive', () => {
       await driveV3Run('gate-run', shared.deps); // → awaitingGate
 
       // 模拟 card handler 点击批准：先 resolveWait，再 append gateResolved
-      resolveWait(runDir, 'deploy-gate', 'approved', 'ou_user');
+      resolveWait(runDir, 'deploy#001-gate', 'approved', 'ou_user');
       appendEvent(join(runDir, 'journal.ndjson'), {
-        type: 'gateResolved', nodeId: 'deploy', waitId: 'deploy-gate', resolution: 'approved', by: 'ou_user',
+        type: 'gateResolved', nodeId: 'deploy', waitId: 'deploy#001-gate', resolution: 'approved', by: 'ou_user',
       } as any);
 
       const outcome = await driveV3Run('gate-run', shared.deps); // redrive
@@ -157,9 +157,9 @@ describe('resolveV3GateClick — 幂等 + terminal-safe（codex #5/#1/#2）', ()
       const runDir = toAwaitingGate(base);
       await driveV3Run('gate-run', stubDeps(base).deps); // 写出 pending wait + running journal
 
-      const out = resolveV3GateClick(base, 'gate-run', { waitId: 'deploy-gate', selected: 'approve', by: 'ou_user' });
+      const out = resolveV3GateClick(base, 'gate-run', { waitId: 'deploy#001-gate', selected: 'approve', by: 'ou_user' });
       expect(out).toEqual({ kind: 'resolved', resolution: 'approved' });
-      expect(readWait(runDir, 'deploy-gate')?.status).toBe('approved');
+      expect(readWait(runDir, 'deploy#001-gate')?.status).toBe('approved');
       const gr = readJournal(join(runDir, 'journal.ndjson')).find((e) => e.type === 'gateResolved') as any;
       expect(gr).toBeTruthy();
       expect(gr.resolution).toBe('approved');
@@ -175,14 +175,14 @@ describe('resolveV3GateClick — 幂等 + terminal-safe（codex #5/#1/#2）', ()
     try {
       const runDir = toAwaitingGate(base);
       await driveV3Run('gate-run', stubDeps(base).deps);
-      resolveV3GateClick(base, 'gate-run', { waitId: 'deploy-gate', selected: 'approve', by: 'ou_user' });
+      resolveV3GateClick(base, 'gate-run', { waitId: 'deploy#001-gate', selected: 'approve', by: 'ou_user' });
       const before = readJournal(join(runDir, 'journal.ndjson')).filter((e) => e.type === 'gateResolved').length;
 
-      const out = resolveV3GateClick(base, 'gate-run', { waitId: 'deploy-gate', selected: 'reject', by: 'ou_other' });
+      const out = resolveV3GateClick(base, 'gate-run', { waitId: 'deploy#001-gate', selected: 'reject', by: 'ou_other' });
       expect(out).toEqual({ kind: 'already-settled', status: 'approved' });
       const after = readJournal(join(runDir, 'journal.ndjson')).filter((e) => e.type === 'gateResolved').length;
       expect(after).toBe(before);
-      expect(readWait(runDir, 'deploy-gate')?.status).toBe('approved');
+      expect(readWait(runDir, 'deploy#001-gate')?.status).toBe('approved');
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
@@ -193,7 +193,7 @@ describe('resolveV3GateClick — 幂等 + terminal-safe（codex #5/#1/#2）', ()
     try {
       const runDir = toAwaitingGate(base);
       await driveV3Run('gate-run', stubDeps(base).deps);
-      const wait = readWait(runDir, 'deploy-gate')!;
+      const wait = readWait(runDir, 'deploy#001-gate')!;
       writePendingWait(runDir, {
         waitId: wait.waitId,
         nodeId: wait.nodeId,
@@ -203,10 +203,10 @@ describe('resolveV3GateClick — 幂等 + terminal-safe（codex #5/#1/#2）', ()
         approvers: ['ou_owner'],
       });
 
-      const out = resolveV3GateClick(base, 'gate-run', { waitId: 'deploy-gate', selected: 'approve', by: 'ou_intruder' });
+      const out = resolveV3GateClick(base, 'gate-run', { waitId: 'deploy#001-gate', selected: 'approve', by: 'ou_intruder' });
 
       expect(out).toEqual({ kind: 'unauthorized' });
-      expect(readWait(runDir, 'deploy-gate')?.status).toBe('pending');
+      expect(readWait(runDir, 'deploy#001-gate')?.status).toBe('pending');
       expect(readJournal(join(runDir, 'journal.ndjson')).some((e) => e.type === 'gateResolved')).toBe(false);
     } finally {
       rmSync(base, { recursive: true, force: true });
@@ -220,9 +220,9 @@ describe('resolveV3GateClick — 幂等 + terminal-safe（codex #5/#1/#2）', ()
       await driveV3Run('gate-run', stubDeps(base).deps);
       appendEvent(join(runDir, 'journal.ndjson'), { type: 'runSucceeded' } as any);
 
-      const out = resolveV3GateClick(base, 'gate-run', { waitId: 'deploy-gate', selected: 'approve', by: 'ou_user' });
+      const out = resolveV3GateClick(base, 'gate-run', { waitId: 'deploy#001-gate', selected: 'approve', by: 'ou_user' });
       expect(out).toEqual({ kind: 'stale-run', reason: 'terminal' });
-      expect(readWait(runDir, 'deploy-gate')?.status).toBe('pending');
+      expect(readWait(runDir, 'deploy#001-gate')?.status).toBe('pending');
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
@@ -244,7 +244,7 @@ describe('resolveV3GateClick — 幂等 + terminal-safe（codex #5/#1/#2）', ()
     const base = freshBase();
     try {
       seedApprovedRun(base, 'gate-run', { binding: BINDING });
-      const out = resolveV3GateClick(base, 'gate-run', { waitId: 'deploy-gate', selected: 'approve', by: 'u' });
+      const out = resolveV3GateClick(base, 'gate-run', { waitId: 'deploy#001-gate', selected: 'approve', by: 'u' });
       expect(out).toEqual({ kind: 'stale-run', reason: 'missing' });
     } finally {
       rmSync(base, { recursive: true, force: true });
@@ -256,6 +256,32 @@ describe('resolveV3GateClick — 幂等 + terminal-safe（codex #5/#1/#2）', ()
     try {
       expect(() => resolveV3GateClick(base, '../escape', { waitId: 'w', selected: 'approve', by: 'u' })).toThrow(/invalid runId/);
       await expect(driveV3Run('a/b', stubDeps(base).deps)).rejects.toThrow(/invalid runId/);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('stale-card 防护:回溯后旧 A#001-gate 卡点击失效,A#002-gate 才有效', () => {
+    const base = freshBase();
+    try {
+      const runId = 'gate-revisit';
+      const { runDir } = birthRun({ goal: 'g', baseDir: base, runId, chatBinding: BINDING });
+      const jp = join(runDir, 'journal.ndjson');
+      appendEvent(jp, { type: 'runStarted', runId });
+      // A#001 派 gate → 被回溯 supersede → A#002 重新派 gate（两张独立 wait 文件）
+      appendEvent(jp, { type: 'gateDispatched', nodeId: 'A', instanceId: 'A#001', waitId: 'A#001-gate' });
+      writePendingWait(runDir, { waitId: 'A#001-gate', nodeId: 'A', instanceId: 'A#001', prompt: '批?' });
+      appendEvent(jp, { type: 'nodeInstanceSuperseded', nodeId: 'A', instanceId: 'A#001', byNodeId: 'A', reason: 'refresh' });
+      appendEvent(jp, { type: 'gateDispatched', nodeId: 'A', instanceId: 'A#002', waitId: 'A#002-gate' });
+      writePendingWait(runDir, { waitId: 'A#002-gate', nodeId: 'A', instanceId: 'A#002', prompt: '批?' });
+
+      // 旧 A#001 卡点击 → stale-node（wait.instanceId A#001 ≠ 当前 effective A#002）
+      expect(resolveV3GateClick(base, runId, { waitId: 'A#001-gate', selected: 'approve', by: 'ou_user' }))
+        .toEqual({ kind: 'stale-run', reason: 'stale-node' });
+      expect(readWait(runDir, 'A#001-gate')?.status).toBe('pending'); // 没被消费
+      // 当前 A#002 卡点击 → 正常 resolved
+      expect(resolveV3GateClick(base, runId, { waitId: 'A#002-gate', selected: 'approve', by: 'ou_user' }))
+        .toEqual({ kind: 'resolved', resolution: 'approved' });
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
@@ -496,9 +522,9 @@ describe('createV3GateRunner — coalescing：drive 期间 click 不丢（codex 
       expect(postCalled).toBe(true);
 
       // 模拟用户点卡（gate resolve）+ 在 drive 仍 in-flight 时再 driveDetached
-      resolveWait(runDir, 'deploy-gate', 'approved', 'ou_user');
+      resolveWait(runDir, 'deploy#001-gate', 'approved', 'ou_user');
       appendEvent(join(runDir, 'journal.ndjson'), {
-        type: 'gateResolved', nodeId: 'deploy', waitId: 'deploy-gate', resolution: 'approved', by: 'ou_user',
+        type: 'gateResolved', nodeId: 'deploy', waitId: 'deploy#001-gate', resolution: 'approved', by: 'ou_user',
       } as any);
       runner.driveDetached('gate-run'); // in-flight → coalesce 成 rerun（不能丢）
 

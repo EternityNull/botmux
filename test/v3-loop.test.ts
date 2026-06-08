@@ -341,7 +341,7 @@ describe('decideNext loop scheduling', () => {
     new Map(Object.entries(entries).map(([k, v]) => [k, { status: v as never }]));
 
   it('gates startLoop on outer deps', () => {
-    expect(decideNext(dag, st({}))).toEqual([{ kind: 'dispatchWork', nodeId: 'prepare' }]);
+    expect(decideNext(dag, st({}))).toEqual([{ kind: 'dispatchWork', nodeId: 'prepare', instanceId: 'prepare#001' }]);
     const actions = decideNext(dag, st({ prepare: 'done' }));
     expect(actions).toEqual([{ kind: 'startLoop', loopId: 'fix' }]);
   });
@@ -399,7 +399,7 @@ describe('decideNext loop scheduling', () => {
       st({ prepare: 'done', fix: 'done' }),
       ls({ iteration: 2, decided: true, lastDecision: 'exit' }),
     );
-    expect(actions).toEqual([{ kind: 'dispatchWork', nodeId: 'report' }]);
+    expect(actions).toEqual([{ kind: 'dispatchWork', nodeId: 'report', instanceId: 'report#001' }]);
   });
 });
 

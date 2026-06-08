@@ -27,6 +27,9 @@ export type V3NodeStatus =
   | 'skipped'      // triggerRule unsatisfied; acceptable terminal if a sink still reaches done
   | 'cancelled'    // early-release loser; neutral terminal, not fail-fast
   | 'blocked'      // semantic/contract failure — recoverable via retry (new attempt)
+  | 'superseded'   // an INSTANCE refreshed by a cross-node revisit; the node gets
+                   //   a fresh instance and re-dispatches.  A settled-terminal for
+                   //   that instance, NOT a failure (instance restoration 2026-06-08)
   | 'failed';      // infrastructure failure / gate rejected / timed out — needs intervention
 
 export interface V3NodeState {
@@ -36,6 +39,11 @@ export interface V3NodeState {
    *  gate transitions the node straight to `failed` (set by the runtime), so
    *  this flag only ever records the approved case. */
   gateCleared?: boolean;
+  /** The current live runtime instance of this DEFINITION node (`A#002`).
+   *  Set on dispatch; cleared when a revisit supersedes it (the node then
+   *  re-dispatches a fresh instance).  Absent on the pre-instance-layer path
+   *  (plain nodeId-keyed events) and loop body expansions. */
+  effectiveInstanceId?: string;
 }
 
 /** nodeId → state.  A node absent from the map is treated as `pending`. */
@@ -91,11 +99,16 @@ export type V3Action =
   /** Abort an early-release loser whose remaining products are no longer used. */
   | { kind: 'cancelNode'; nodeId: string; byNodeId: string; detail?: string }
   /** Post the humanGate approval card + persist a `waits/<id>.json` (Q10). */
-  | { kind: 'dispatchGate'; nodeId: string }
+  | { kind: 'dispatchGate'; nodeId: string; instanceId?: string }
   /** Spawn an ephemeral worker via `runNode` for this node's goal.  `loop` is
    *  set for body-instance dispatches (the runtime synthesizes the instance
-   *  node from the loop's body definition). */
-  | { kind: 'dispatchWork'; nodeId: string; loop?: V3LoopRef; omitted?: V3OmittedInput[] }
+   *  node from the loop's body definition).  `instanceId` is set when this is a
+   *  cross-node-revisit RE-DISPATCH (`A#002`): the prior instance was
+   *  superseded, so decideNext computes the next instance number deterministically
+   *  from `state.instances` (constraint 4 — the action carries it, the runtime
+   *  does not guess).  Absent on a first dispatch / loop body (those keep the
+   *  pre-instance-layer path until the runtime brick threads instances through). */
+  | { kind: 'dispatchWork'; nodeId: string; instanceId?: string; loop?: V3LoopRef; omitted?: V3OmittedInput[] }
   // ── loop control (the runtime translates each into ONE journal append) ──
   /** Outer deps of a loop are done → append loopStarted. */
   | { kind: 'startLoop'; loopId: string }
@@ -134,6 +147,7 @@ export function decideNext(
   state: V3RunState,
   loops: V3LoopRunState = new Map(),
   edges: V3EdgeRunState = new Map(),
+  instances: V3RunState = new Map(),
 ): V3Action[] {
   const order = topologicalOrder(dag);
   const nodes = new Map(dag.nodes.map((n) => [n.id, n]));
@@ -261,14 +275,26 @@ export function decideNext(
     }
 
     if (node.humanGate && !s.gateCleared) {
-      actions.push({ kind: 'dispatchGate', nodeId: id });
+      // The gate belongs to the instance that will run on approval — same
+      // id resolution as dispatchWork (constraint 6), so gate + work share it.
+      actions.push({ kind: 'dispatchGate', nodeId: id, instanceId: s.effectiveInstanceId ?? nextInstanceId(id, instances) });
       continue;
     }
-    actions.push(
-      readiness.omitted
-        ? { kind: 'dispatchWork', nodeId: id, omitted: readiness.omitted }
-        : { kind: 'dispatchWork', nodeId: id },
-    );
+    // Every plain-node dispatch runs under a runtime instance (constraint 4 +
+    // design rule: 首派也要 #001).  decideNext — not the runtime — owns the id:
+    //   - blocked / human-ask RETRY stays in the SAME instance (constraint 5):
+    //     the node still carries `effectiveInstanceId`, so reuse it (the retry
+    //     is a new attempt INSIDE it, e.g. A#001/attempts/002).
+    //   - first dispatch (no effective) → #001; a revisit re-dispatch (supersede
+    //     cleared the effective) → next #NNN from state.instances.
+    // (loop body dispatches use loopInstanceId, handled above.)
+    const instanceId = s.effectiveInstanceId ?? nextInstanceId(id, instances);
+    actions.push({
+      kind: 'dispatchWork',
+      nodeId: id,
+      instanceId,
+      ...(readiness.omitted ? { omitted: readiness.omitted } : {}),
+    });
     for (const loser of readiness.earlyLosers ?? []) {
       if (canCancelLoser(loser, id, dag, state, edges)) {
         actions.push({
@@ -313,7 +339,7 @@ function readinessFor(node: V3Node, state: V3RunState, edges: V3EdgeRunState): N
     const source = st(state, dep.from);
     if (source.status === 'done') {
       if (!dep.when) return { kind: 'active', from: dep.from };
-      const edge = edges.get(edgeKey(dep.from, node.id));
+      const edge = edges.get(currentEdgeKey(dep.from, node.id, state));
       if (!edge) return { kind: 'unresolved', from: dep.from };
       return edge.active
         ? { kind: 'active', from: dep.from }
@@ -374,8 +400,15 @@ function firstUnresolved(activities: EdgeActivity[]): Extract<EdgeActivity, { ki
   return activities.find((a): a is Extract<EdgeActivity, { kind: 'unresolved' }> => a.kind === 'unresolved');
 }
 
-function edgeKey(from: string, to: string): string {
-  return `${from}->${to}`;
+/** The edge key for the source's CURRENT effective instance — mirrors the key
+ *  materialize stores edgeResolved under (verdict bound to SOURCE instance, per code
+ *  review).  A source revisit (`A#001`→`A#002`) reads a fresh `A#002->B`, never
+ *  the superseded `A#001->B`.  Target is keyed by nodeId (it has no instance at
+ *  edge-resolve time); a target-only revisit reusing the verdict is a known,
+ *  documented limitation. */
+function currentEdgeKey(from: string, to: string, state: V3RunState): string {
+  const fromInst = st(state, from).effectiveInstanceId ?? from;
+  return `${fromInst}->${to}`;
 }
 
 /** The CURRENT iteration's expanded instance ids of a loop node (empty for
@@ -469,7 +502,7 @@ function edgeActivityFor(
   const source = st(state, from);
   if (source.status === 'done') {
     if (!conditional) return { kind: 'active', from };
-    const edge = edges.get(edgeKey(from, to));
+    const edge = edges.get(currentEdgeKey(from, to, state));
     if (!edge) return { kind: 'unresolved', from };
     return edge.active
       ? { kind: 'active', from }
@@ -496,7 +529,11 @@ function terminalStatus(status: V3NodeStatus): boolean {
     status === 'skipped' ||
     status === 'cancelled' ||
     status === 'failed' ||
-    status === 'blocked';
+    status === 'blocked' ||
+    // A superseded INSTANCE is settled (it won't change); the DEFINITION node
+    // re-dispatches under a fresh instance, but that is tracked at the node
+    // level (effectiveInstanceId), not by this per-instance status.
+    status === 'superseded';
 }
 
 function sinkOmissionDetail(sinks: string[], state: V3RunState): string {
@@ -520,4 +557,22 @@ export function findSinks(dag: V3Dag): string[] {
 
 function st(state: V3RunState, id: string): V3NodeState {
   return state.get(id) ?? { status: 'pending' };
+}
+
+/** The next runtime instance id for a definition node, computed from every
+ *  instance that has EVER appeared for it (`running/done/blocked/superseded`,
+ *  per code review — not just the effective/terminal ones, else a re-dispatch
+ *  could collide with an existing `A#002`).  First dispatch (no instances) →
+ *  `#001`; a revisit re-dispatch → `#002`, … — instance is the real runtime
+ *  node, so EVERY plain-node dispatch gets one (design rule: 首派也要 #001).  Instance
+ *  ids are `<nodeId>#NNN`, zero-padded to mirror attempt `001`. */
+function nextInstanceId(nodeId: string, instances: V3RunState): string {
+  const prefix = `${nodeId}#`;
+  let max = 0;
+  for (const instanceId of instances.keys()) {
+    if (!instanceId.startsWith(prefix)) continue;
+    const n = Number.parseInt(instanceId.slice(prefix.length), 10);
+    if (Number.isFinite(n) && n > max) max = n;
+  }
+  return `${prefix}${String(max + 1).padStart(3, '0')}`;
 }

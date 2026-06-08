@@ -18,10 +18,12 @@
  */
 
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, relative, isAbsolute } from 'node:path';
 
 import {
   DEFAULT_NODE_TIMEOUT_SEC,
+  DEFAULT_REVISIT_BUDGET_PER_PAIR,
+  DEFAULT_REVISIT_BUDGET_PER_RUN,
   isGoalNode,
   isLoopNode,
   loopInstanceId,
@@ -123,7 +125,8 @@ export function renderGoalFile(
     'You are an autonomous agent completing exactly ONE botmux v3 workflow node.',
     'Work toward the goal above until it is done, then stop. Do NOT ask the user with interactive tools (they are disabled in this mode). If you genuinely need a human DECISION to proceed, use the human-ask escape hatch described below (also available as the `botmux-goal-ask` skill).',
     '',
-    `- Upstream inputs: the file at $${E.INPUTS_PATH} is a JSON object \`{ "inputs": [...] }\` listing upstream products, each with an absolute \`path\`. Read only the ones the goal needs (it may be empty). If an \`omitted\` array is present, those declared inputs were intentionally not produced (their workflow branch was not taken) — treat their absence as by-design, do NOT invent their content.`,
+    `- Upstream inputs: the file at $${E.INPUTS_PATH} is a JSON object \`{ "inputs": [...] }\` listing upstream products, each with an absolute \`path\`. Read only the ones the goal needs (it may be empty). If it includes an input entry \`{ "from": "human", "name": "answer", "path": "..." }\`, read that JSON file before continuing. If an \`omitted\` array is present, those declared inputs were intentionally not produced (their workflow branch was not taken) — treat their absence as by-design, do NOT invent their content.`,
+    `- Revisit feedback: if any input has \`"from": "revisit"\`, a DOWNSTREAM node sent this node back because its product was inadequate. You MUST read these before doing anything else: \`reason\` (why you were sent back), \`source:*\` (the downstream node's output — the evidence of what was wrong), and \`previous:*\` (YOUR OWN previous output — edit/fix it, do not rewrite from scratch). Address the reason; do not just reproduce the prior output.`,
     `- Output: write ALL products under the directory at $${E.OUTPUT_DIR}. Do NOT write anything outside that directory.`,
     `- Manifest (required): before you finish, write a JSON manifest to $${E.MANIFEST_PATH} with exactly this shape:`,
     '',
@@ -148,9 +151,9 @@ export function renderGoalFile(
     '',
     '## Asking a human (only when a DECISION truly needs a person)',
     `If — and ONLY if — you cannot proceed without a human's judgement call (a choice only a person can make; NOT something you can research, infer, or decide yourself), use the runtime human-ask:`,
-    `  1. Write a JSON file to $${E.ATTEMPT_DIR}/${GOAL_ASK_FILE} of the shape \`{ "question": "<one clear question>", "options": ["<2-6 concrete choices>"] }\`.`,
+    `  1. Write a JSON file to $${E.ATTEMPT_DIR}/${GOAL_ASK_FILE}. Use \`{ "question": "<one clear question>", "options": ["<2-6 concrete choices>"] }\` for a choice, or \`{ "question": "<one clear question>", "freeText": true }\` when the human must provide details in their own words.`,
     `  2. Write a failure manifest with \`error.code: "${ASK_HUMAN_ERROR_CODE}"\`, \`error.retryable: true\`, and \`summary\` = your question, then STOP.`,
-    `A human picks one option; this node then RE-RUNS with their choice injected into $${E.INPUTS_PATH} as an input entry \`{ "from": "human", "name": "answer", "path": "..." }\` (read that JSON file and continue from there). Prefer deciding yourself — every ask pauses the whole workflow on a person.`,
+    `A human answers; this node then RE-RUNS with their answer injected into $${E.INPUTS_PATH} as an input entry \`{ "from": "human", "name": "answer", "path": "..." }\`. Read that JSON file's \`selected\` or \`text\` field and continue from there. Prefer deciding yourself — every ask pauses the whole workflow on a person.`,
     '',
   ].join('\n');
 }
@@ -189,7 +192,7 @@ export function classifyTerminal(
  * Defensive: a missing / malformed / out-of-bounds file yields `undefined`, so a
  * broken ask degrades to a plain blocked card rather than crashing the drive —
  * the manifest's `error.message` still carries the question text for the human.
- * Needs ≥2 options (a choice) and caps at 6 (card sanity).  Exported for tests.
+ * Accepts either 2–6 concrete options or `freeText:true`.  Exported for tests.
  */
 export function readGoalAsk(askPath: string): GoalAsk | undefined {
   if (!existsSync(askPath)) return undefined;
@@ -203,6 +206,11 @@ export function readGoalAsk(askPath: string): GoalAsk | undefined {
   const o = parsed as Record<string, unknown>;
   const question = typeof o.question === 'string' ? o.question.trim() : '';
   if (!question) return undefined;
+  const hasOptions = Object.prototype.hasOwnProperty.call(o, 'options');
+  if (o.freeText === true) {
+    if (hasOptions) return undefined;
+    return { question, freeText: true };
+  }
   const options = Array.isArray(o.options)
     ? o.options.filter((x): x is string => typeof x === 'string' && x.trim() !== '').map((x) => x.trim())
     : [];
@@ -235,6 +243,80 @@ export function mergeNodeCapability(
 export interface ResultValidation {
   ok: boolean;
   problems?: string[];
+}
+
+/** Read a worker's cross-node revisit request from `result.json` (if any).  A
+ *  revisit is `{ "status": "revisit", "revisitTo": "<ancestor>", "reason"? }`.
+ *  Absent result.json / non-revisit status → `{ ok:true }` (no request).  A
+ *  malformed revisit (missing/blank revisitTo, non-string reason) → `ok:false`
+ *  so the runtime blocks it as resultInvalid.  The ancestor membership check
+ *  (toNodeId ∈ node.revisitTo) is the caller's (it has the node). */
+/** Two-tier revisit budget check (anti-infinite-loop): a source→target pair may
+ *  revisit `DEFAULT_REVISIT_BUDGET_PER_PAIR` times, and the whole run
+ *  `DEFAULT_REVISIT_BUDGET_PER_RUN` times, each extendable by a
+ *  `revisitBudgetGranted` event.  Counts revisits ALREADY made; returns
+ *  `{ok:false, tier, detail}` when this next revisit would exceed a tier —
+ *  `tier` tells the grant card which scope to extend (菲菲 review). */
+export function revisitBudgetStatus(
+  events: StoredEvent[],
+  sourceNodeId: string,
+  toNodeId: string,
+): { ok: true } | { ok: false; tier: 'pair' | 'run'; detail: string } {
+  let pairUsed = 0;
+  let runUsed = 0;
+  let pairGranted = 0;
+  let runGranted = 0;
+  for (const e of events) {
+    if (e.type === 'nodeRevisitRequested') {
+      runUsed++;
+      if (e.nodeId === sourceNodeId && e.toNodeId === toNodeId) pairUsed++;
+    } else if (e.type === 'revisitBudgetGranted') {
+      if (e.sourceNodeId === sourceNodeId && e.toNodeId === toNodeId) pairGranted++;
+      else if (e.sourceNodeId === undefined && e.toNodeId === undefined) runGranted++;
+    }
+  }
+  const pairLimit = DEFAULT_REVISIT_BUDGET_PER_PAIR + pairGranted;
+  const runLimit = DEFAULT_REVISIT_BUDGET_PER_RUN + runGranted;
+  if (pairUsed >= pairLimit) {
+    return { ok: false, tier: 'pair', detail: `revisit budget exhausted for ${sourceNodeId}->${toNodeId} (${pairUsed}/${pairLimit}) — grant +1 (this pair) to continue` };
+  }
+  if (runUsed >= runLimit) {
+    return { ok: false, tier: 'run', detail: `run-wide revisit budget exhausted (${runUsed}/${runLimit}) — grant +1 (run) to continue` };
+  }
+  return { ok: true };
+}
+
+export function readRevisitRequest(
+  manifest: Manifest,
+  outputDir: string,
+): { ok: true; request?: { toNodeId: string; reason?: string } } | { ok: false; problems: string[] } {
+  const entry = manifest.files.find((f) => f.path === 'result.json');
+  if (!entry) return { ok: true };
+  let value: unknown;
+  try {
+    value = JSON.parse(readFileSync(join(outputDir, entry.path), 'utf-8'));
+  } catch {
+    return { ok: true }; // unreadable result.json: not a revisit (resultSchema path reports it)
+  }
+  if (!value || typeof value !== 'object' || (value as Record<string, unknown>).status !== 'revisit') {
+    return { ok: true };
+  }
+  const v = value as Record<string, unknown>;
+  const problems: string[] = [];
+  if (typeof v.revisitTo !== 'string' || v.revisitTo.trim() === '') {
+    problems.push('result.json status "revisit" requires a non-empty string "revisitTo"');
+  }
+  if (v.reason !== undefined && typeof v.reason !== 'string') {
+    problems.push('result.json "reason" must be a string when present');
+  }
+  if (problems.length > 0) return { ok: false, problems };
+  return {
+    ok: true,
+    request: {
+      toNodeId: v.revisitTo as string,
+      ...(typeof v.reason === 'string' && v.reason ? { reason: v.reason } : {}),
+    },
+  };
 }
 
 /**
@@ -315,16 +397,21 @@ function attemptNumber(attemptId: string): number | undefined {
  * a first dispatch.  Dispatch events are the authority for "seen"; a
  * reservation is consumed by a later `nodeDispatched` with the same number.
  */
-export function nextAttemptIdFor(events: StoredEvent[], nodeId: string): string {
+export function nextAttemptIdFor(events: StoredEvent[], key: string): string {
+  // `key` is the dispatch namespace: a runtime instance (`A#001`), a loop body
+  // expansion (`loopId.i001.code`), or a legacy nodeId.  Match events by their
+  // instance when they carry one, else by nodeId — so `A#002`'s attempts are
+  // counted separately from `A#001`'s (constraint 3/5).
+  const matches = (e: { nodeId: string; instanceId?: string }): boolean => (e.instanceId ?? e.nodeId) === key;
   let maxSeen = 0;
   let reserved: number | undefined;
   for (const e of events) {
-    if (e.type === 'nodeDispatched' && e.nodeId === nodeId) {
+    if (e.type === 'nodeDispatched' && matches(e)) {
       const n = attemptNumber(e.attemptId);
       if (n === undefined) continue;
       maxSeen = Math.max(maxSeen, n);
       if (reserved === n) reserved = undefined; // reservation consumed
-    } else if (e.type === 'nodeRetryRequested' && e.nodeId === nodeId) {
+    } else if (e.type === 'nodeRetryRequested' && matches(e)) {
       const n = attemptNumber(e.nextAttemptId);
       if (n === undefined) continue;
       reserved = n;
@@ -332,15 +419,17 @@ export function nextAttemptIdFor(events: StoredEvent[], nodeId: string): string 
     }
   }
   const n = reserved ?? maxSeen + 1;
-  return `${nodeId}/attempts/${String(n).padStart(3, '0')}`;
+  return `${key}/attempts/${String(n).padStart(3, '0')}`;
 }
 
-/** Latest dispatched attemptId for a node (the `previousAttemptId` a retry
- *  entrypoint must reference).  Undefined when the node never dispatched. */
-export function latestAttemptIdFor(events: StoredEvent[], nodeId: string): string | undefined {
+/** Latest dispatched attemptId for a dispatch `key` (the `previousAttemptId` a
+ *  retry entrypoint must reference).  `key` is an instance (`A#001`), a loop
+ *  body expansion, or a legacy nodeId — matched by `(instanceId ?? nodeId)` so
+ *  a retry stays inside the same instance.  Undefined when never dispatched. */
+export function latestAttemptIdFor(events: StoredEvent[], key: string): string | undefined {
   let latest: string | undefined;
   for (const e of events) {
-    if (e.type === 'nodeDispatched' && e.nodeId === nodeId) latest = e.attemptId;
+    if (e.type === 'nodeDispatched' && (e.instanceId ?? e.nodeId) === key) latest = e.attemptId;
   }
   return latest;
 }
@@ -487,7 +576,7 @@ export async function runWorkflow(
     writeState(statePath, snap);
     if (snap.runStatus !== 'running') break;
 
-    const actions = decideNext(dag, snap.nodes, snap.loops, snap.edges);
+    const actions = decideNext(dag, snap.nodes, snap.loops, snap.edges, snap.instances);
 
     // Terminal sweep: write the run terminal event, then re-tick so the top of
     // the loop observes it and breaks (single exit path).
@@ -560,10 +649,10 @@ export async function runWorkflow(
           const botSnap = botSnapshots.get(botKey)!;
           if ((botInFlight.get(botKey) ?? 0) >= perBotCap) continue;
           if ((cliInFlight.get(botSnap.cliId) ?? 0) >= perCliCap) continue;
-          startWork(node, botSnap, botKey, events, a.loop, a.omitted);
+          startWork(node, botSnap, botKey, events, a.loop, a.omitted, a.instanceId);
           startedThisTick++;
         } else if (a.kind === 'dispatchGate') {
-          startGate(nodesById.get(a.nodeId)!);
+          startGate(nodesById.get(a.nodeId)!, a.instanceId);
           startedThisTick++;
         }
       }
@@ -620,13 +709,19 @@ export async function runWorkflow(
     events: StoredEvent[],
     loopRef?: V3LoopRef,
     omitted?: GoalInputs['omitted'],
+    instanceId?: string,
   ): void {
+    // The dispatch key namespaces the attempt dir + journal events.  For a
+    // plain node it's the runtime instance (`A#001`); for a loop body it's the
+    // expanded node.id (`loopId.i001.code`); legacy/no-instance falls back to
+    // node.id.  attempt dir = `<runDir>/<key>/attempts/NNN`.
+    const dispatchKey = instanceId ?? node.id;
     // Attempt number derived from the journal: 001 on first dispatch, the
     // reserved nextAttemptId after a blocked retry (no hardcoded 001 — a retry
     // must not overwrite the previous attempt's logs/manifest/pty).
-    const attemptId = nextAttemptIdFor(events, node.id);
+    const attemptId = nextAttemptIdFor(events, dispatchKey);
     const attemptNNN = attemptId.slice(attemptId.lastIndexOf('/') + 1);
-    const attemptDir = join(runDir, node.id, 'attempts', attemptNNN);
+    const attemptDir = join(runDir, dispatchKey, 'attempts', attemptNNN);
     const outputDir = join(attemptDir, 'work');
     mkdirSync(outputDir, { recursive: true });
 
@@ -659,7 +754,7 @@ export async function runWorkflow(
       [GOAL_ENV.V3_MARKER]: '1',
     };
 
-    appendEvent(journalPath, { type: 'nodeDispatched', nodeId: node.id, attemptId, loop: loopRef });
+    appendEvent(journalPath, { type: 'nodeDispatched', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, loop: loopRef });
     botInFlight.set(botKey, (botInFlight.get(botKey) ?? 0) + 1);
     cliInFlight.set(botSnap.cliId, (cliInFlight.get(botSnap.cliId) ?? 0) + 1);
 
@@ -667,7 +762,7 @@ export async function runWorkflow(
     // contract types `runNode` to V3GoalNode, so narrow explicitly.
     if (!isGoalNode(node)) {
       appendEvent(journalPath, {
-        type: 'nodeFailed', nodeId: node.id, attemptId,
+        type: 'nodeFailed', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId,
         errorClass: 'workerError', message: `node "${node.id}" is not a goal node`,
       });
       releaseSlots(botKey, botSnap.cliId);
@@ -702,6 +797,7 @@ export async function runWorkflow(
         appendEvent(journalPath, {
           type: 'nodeSessionReady',
           nodeId: node.id,
+          ...(instanceId ? { instanceId } : {}),
           attemptId,
           sessionInfo: { sessionId: info.sessionId, webPort: info.webPort },
           ptyLogPath: info.ptyLogPath,
@@ -720,6 +816,43 @@ export async function runWorkflow(
         const manifestSaysOk = verdict.ok && verdict.manifest?.status === 'ok';
 
         if (result.status === 'ok' && manifestSaysOk) {
+          // Cross-node revisit: the worker's result.json may request a jump back
+          // to an ancestor (`status:"revisit", revisitTo, reason`).  Recognized
+          // BEFORE success/resultSchema — a revisit is not a node success.
+          const revisit = readRevisitRequest(verdict.manifest!, outputDir);
+          if (!revisit.ok) {
+            appendEvent(journalPath, {
+              type: 'nodeBlocked', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId,
+              errorClass: 'resultInvalid', message: revisit.problems.join('; '),
+            });
+            return;
+          }
+          if (revisit.request) {
+            if (!node.revisitTo?.includes(revisit.request.toNodeId)) {
+              appendEvent(journalPath, {
+                type: 'nodeBlocked', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId,
+                errorClass: 'resultInvalid',
+                message: `result.json requests revisit to "${revisit.request.toNodeId}", not in node "${node.id}".revisitTo`,
+              });
+              return;
+            }
+            // Anti-infinite-loop: a revisit consumes per-pair + per-run budget.
+            // Exhausted → block this node (recoverable) instead of superseding;
+            // a human grants +1 (revisitBudgetGranted) then retries.
+            const budget = revisitBudgetStatus(readJournal(journalPath), node.id, revisit.request.toNodeId);
+            if (!budget.ok) {
+              appendEvent(journalPath, {
+                type: 'nodeBlocked', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId,
+                errorClass: 'resultInvalid', errorCode: 'REVISIT_BUDGET_EXHAUSTED', message: budget.detail,
+                revisitTo: revisit.request.toNodeId,
+              });
+              return;
+            }
+            // goal-node dispatches always carry instanceId (首派 #001); the
+            // fallback keeps the type total for the legacy/no-instance path.
+            appendRevisitEvents(node.id, instanceId ?? node.id, attemptId, revisit.request, result.manifestPath);
+            return;
+          }
           // Opt-in structured-result contract: the manifest MUST list a
           // `result.json` entry (so it went through the manifest validator's
           // path/hash checks like every other product), and the file must
@@ -729,7 +862,7 @@ export async function runWorkflow(
             const entry = verdict.manifest!.files.find((f) => f.path === 'result.json');
             if (!entry) {
               appendEvent(journalPath, {
-                type: 'nodeBlocked', nodeId: node.id, attemptId,
+                type: 'nodeBlocked', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId,
                 errorClass: 'resultInvalid',
                 message: 'node declares resultSchema but its manifest lists no "result.json" file',
               });
@@ -738,7 +871,7 @@ export async function runWorkflow(
             const res = validateResult(join(outputDir, entry.path), node.resultSchema);
             if (!res.ok) {
               appendEvent(journalPath, {
-                type: 'nodeBlocked', nodeId: node.id, attemptId,
+                type: 'nodeBlocked', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId,
                 errorClass: 'resultInvalid',
                 message: (res.problems ?? ['result.json failed schema validation']).join('; '),
               });
@@ -746,7 +879,7 @@ export async function runWorkflow(
             }
           }
           appendEvent(journalPath, {
-            type: 'nodeSucceeded', nodeId: node.id, attemptId, manifestPath: result.manifestPath,
+            type: 'nodeSucceeded', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, manifestPath: result.manifestPath,
           });
           return;
         }
@@ -794,19 +927,19 @@ export async function runWorkflow(
               : undefined;
           appendEvent(journalPath, {
             type: 'nodeBlocked',
-            nodeId: node.id, attemptId, errorClass, errorCode, message,
+            nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, errorClass, errorCode, message,
             ...(ask ? { ask } : {}),
           });
         } else {
           appendEvent(journalPath, {
             type: 'nodeFailed',
-            nodeId: node.id, attemptId, errorClass, errorCode, message,
+            nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, errorClass, errorCode, message,
           });
         }
       })
       .catch((err: unknown) => {
         appendEvent(journalPath, {
-          type: 'nodeFailed', nodeId: node.id, attemptId,
+          type: 'nodeFailed', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId,
           errorClass: 'workerError', message: err instanceof Error ? err.message : String(err),
         });
       })
@@ -822,13 +955,84 @@ export async function runWorkflow(
     inFlight.set(node.id, p);
   }
 
-  function startGate(node: V3Node): void {
-    const waitId = `${node.id}-gate`; // MVP: one gate per node
+  /** A node's transitive downstream cone (the node itself + every node reachable
+   *  via `depends` edges).  The set a revisit to `root` must refresh: `root`'s
+   *  product changed, so every result derived from it is stale. */
+  function affectedNodesFrom(root: string): string[] {
+    const reachable = new Set<string>([root]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const n of dag.nodes) {
+        if (reachable.has(n.id)) continue;
+        if (n.depends.some((d) => reachable.has(d.from))) {
+          reachable.add(n.id);
+          changed = true;
+        }
+      }
+    }
+    return [...reachable];
+  }
+
+  /** A worker requested a cross-node revisit to ancestor `toNodeId`: journal the
+   *  request, then supersede the CURRENT effective instance of the target AND its
+   *  whole downstream cone (mark-only, files kept).  materialize then drops their
+   *  effectiveInstanceId → decideNext re-dispatches fresh `#NNN` instances. */
+  function appendRevisitEvents(
+    nodeId: string,
+    instanceId: string,
+    attemptId: string,
+    request: { toNodeId: string; reason?: string },
+    sourceManifestPath: string,
+  ): void {
+    // Capture feedback paths BEFORE the supersede sweep, while the target's
+    // current effective instance + its successful manifest are still resolvable.
+    const events0 = readJournal(journalPath);
+    const snap = materialize(events0);
+    const targetEff = snap.nodes.get(request.toNodeId)?.effectiveInstanceId;
+    const targetSucc = targetEff
+      ? [...events0].reverse().find((e): e is StoredEvent & { type: 'nodeSucceeded' } =>
+          e.type === 'nodeSucceeded' && (e.instanceId ?? e.nodeId) === targetEff)
+      : undefined;
+    // Persist the reason as a file the target's fresh instance can Read.  The
+    // journal stores runDir-RELATIVE paths (run-dir portability + no abs-path
+    // leakage into projections/cards); buildInputs resolves to absolute on read.
+    let reasonPathRel: string | undefined;
+    if (request.reason) {
+      const dir = join(runDir, 'revisits');
+      mkdirSync(dir, { recursive: true });
+      const abs = join(dir, `${instanceId.replace(/[#/]/g, '-')}-reason.md`);
+      writeFileSync(abs, `# Revisit reason (from ${nodeId} / ${instanceId})\n\n${request.reason}\n`);
+      reasonPathRel = relative(runDir, abs);
+    }
+    appendEvent(journalPath, {
+      type: 'nodeRevisitRequested',
+      nodeId, instanceId, attemptId, toNodeId: request.toNodeId,
+      ...(request.reason ? { reason: request.reason } : {}),
+      ...(reasonPathRel ? { reasonPath: reasonPathRel } : {}),
+      sourceManifestPath: relative(runDir, sourceManifestPath),
+      ...(targetSucc ? { targetPreviousManifestPath: relative(runDir, targetSucc.manifestPath) } : {}),
+    });
+    for (const affectedNodeId of affectedNodesFrom(request.toNodeId)) {
+      const eff = snap.nodes.get(affectedNodeId)?.effectiveInstanceId;
+      if (!eff) continue; // never-dispatched downstream node has nothing to supersede
+      appendEvent(journalPath, {
+        type: 'nodeInstanceSuperseded',
+        nodeId: affectedNodeId, instanceId: eff, byNodeId: request.toNodeId, reason: 'refresh',
+      });
+    }
+  }
+
+  function startGate(node: V3Node, instanceId?: string): void {
+    // Instance-level waitId so a revisit's fresh gate (`A#002-gate`) gets its own
+    // wait file + card nonce, never overwriting the superseded `A#001-gate`
+    // (stale-card protection).  Legacy/no-instance → `<nodeId>-gate`.
+    const waitId = `${instanceId ?? node.id}-gate`;
     const gate = normalizeGateWaitInput(node.humanGate!);
-    appendEvent(journalPath, { type: 'gateDispatched', nodeId: node.id, waitId });
+    appendEvent(journalPath, { type: 'gateDispatched', nodeId: node.id, ...(instanceId ? { instanceId } : {}), waitId });
 
     if (gateMode === 'suspend') {
-      writePendingWait(runDir, { waitId, nodeId: node.id, ...gate });
+      writePendingWait(runDir, { waitId, nodeId: node.id, ...(instanceId ? { instanceId } : {}), ...gate });
       return;
     }
 
@@ -955,6 +1159,14 @@ export async function runWorkflow(
     a: Extract<V3Action, { kind: 'resolveEdge' }>,
     events: StoredEvent[],
   ): void {
+    // Scope the verdict to the CURRENT effective instances of source/target so a
+    // revisit's `A#001->B#001` verdict never bleeds onto `A#002->B#002`
+    // (constraint 1).  Legacy/no-instance falls back to the bare nodeId.
+    const snap = materialize(events);
+    const fromInstanceId = snap.nodes.get(a.from)?.effectiveInstanceId;
+    const toInstanceId = snap.nodes.get(a.to)?.effectiveInstanceId;
+    const fromKey = fromInstanceId ?? a.from;
+    const instPair = { ...(fromInstanceId ? { fromInstanceId } : {}), ...(toInstanceId ? { toInstanceId } : {}) };
     const target = nodesById.get(a.to);
     const dep = target?.depends.find((d) => d.from === a.from);
     if (!target || !dep?.when) {
@@ -962,7 +1174,8 @@ export async function runWorkflow(
         type: 'edgeResolved',
         from: a.from,
         to: a.to,
-        sourceAttemptId: latestAttemptIdFor(events, a.from) ?? `${a.from}/attempts/unknown`,
+        ...instPair,
+        sourceAttemptId: latestAttemptIdFor(events, fromKey) ?? `${fromKey}/attempts/unknown`,
         active: false,
         detail: 'edge predicate missing at resolution time',
       });
@@ -972,8 +1185,8 @@ export async function runWorkflow(
     const succ = [...events]
       .reverse()
       .find((e): e is StoredEvent & { type: 'nodeSucceeded' } =>
-        e.type === 'nodeSucceeded' && e.nodeId === a.from);
-    const sourceAttemptId = succ?.attemptId ?? `${a.from}/attempts/unknown`;
+        e.type === 'nodeSucceeded' && (e.instanceId ?? e.nodeId) === fromKey);
+    const sourceAttemptId = succ?.attemptId ?? `${fromKey}/attempts/unknown`;
     const key = dep.when.path.slice('result.'.length);
     let active = false;
     let detail = `${dep.when.path}=<unreadable>`;
@@ -997,6 +1210,7 @@ export async function runWorkflow(
       type: 'edgeResolved',
       from: a.from,
       to: a.to,
+      ...instPair,
       sourceAttemptId,
       active,
       detail,
@@ -1009,10 +1223,14 @@ export async function runWorkflow(
     const status = snap.nodes.get(a.nodeId)?.status ?? 'pending';
     if (status !== 'pending' && status !== 'gateWaiting' && status !== 'running') return false;
 
-    const attemptId = latestAttemptIdFor(events, a.nodeId);
+    // Stamp the cancelled INSTANCE so a later instance (`A#002` after a revisit)
+    // settles freely — the cancel suppression in materialize keys by instance.
+    const instanceId = snap.nodes.get(a.nodeId)?.effectiveInstanceId;
+    const attemptId = latestAttemptIdFor(events, instanceId ?? a.nodeId);
     appendEvent(journalPath, {
       type: 'nodeCancelled',
       nodeId: a.nodeId,
+      ...(instanceId ? { instanceId } : {}),
       attemptId,
       reason: 'earlyReleaseLoser',
       byNodeId: a.byNodeId,
@@ -1025,14 +1243,16 @@ export async function runWorkflow(
     return true;
   }
 
-  function pendingGateWaits(state: Map<string, { status: string }>): V3PendingGate[] {
+  function pendingGateWaits(state: Map<string, { status: string; effectiveInstanceId?: string }>): V3PendingGate[] {
     const waits: V3PendingGate[] = [];
     for (const node of dag.nodes) {
       if (state.get(node.id)?.status !== 'gateWaiting') continue;
       const prompt = node.humanGate?.prompt;
       if (!prompt) continue;
       const gate = normalizeGateWaitInput(node.humanGate!);
-      waits.push({ nodeId: node.id, waitId: `${node.id}-gate`, ...gate });
+      // Instance-level waitId mirrors startGate (stale-card protection).
+      const instanceId = state.get(node.id)?.effectiveInstanceId;
+      waits.push({ nodeId: node.id, waitId: `${instanceId ?? node.id}-gate`, ...gate });
     }
     return waits;
   }
@@ -1067,6 +1287,11 @@ export async function runWorkflow(
   ): GoalInputs {
     const inputs: GoalInputs['inputs'] = [];
     const omittedFrom = new Set((omitted ?? []).map((o) => o.from));
+    // Resolve upstream products by the source's CURRENT effective instance, NOT
+    // by nodeId-latest (stale-instance blocker): after a revisit, a stale `A#001` worker
+    // can settle LATE; nodeId-latest would then hand `A#001`'s old product to
+    // `B#002`.  Keying by effectiveInstanceId pins it to `A#002`.
+    const snap = materialize(events);
 
     // Runtime human-ask answer: when THIS dispatch is the retry a human-ask was
     // answered into, inject the persisted answer as `{from:'human', name:'answer'}`
@@ -1086,18 +1311,23 @@ export async function runWorkflow(
       });
     }
 
-    const latestSuccess = (nodeId: string) =>
+    // Latest success for a dispatch `key` (an effective instance `A#002`, a loop
+    // body expansion, or a legacy nodeId), matched by `(instanceId ?? nodeId)`.
+    const latestSuccess = (key: string) =>
       [...events]
         .reverse()
         .find((e): e is StoredEvent & { type: 'nodeSucceeded' } =>
-          e.type === 'nodeSucceeded' && e.nodeId === nodeId);
+          e.type === 'nodeSucceeded' && (e.instanceId ?? e.nodeId) === key);
 
     const pushFrom = (
       label: string,
       nodeId: string,
       filter?: (f: Manifest['files'][number]) => boolean,
     ): void => {
-      const succ = latestSuccess(nodeId);
+      // Pin to the source's current effective instance (falls back to nodeId for
+      // loop bodies / legacy with no instance).
+      const key = snap.nodes.get(nodeId)?.effectiveInstanceId ?? nodeId;
+      const succ = latestSuccess(key);
       if (!succ) return; // deps are gated upstream — defensive skip
       const upstreamOutputDir = join(dirname(succ.manifestPath), 'work');
       const manifest = JSON.parse(readFileSync(succ.manifestPath, 'utf-8')) as Manifest;
@@ -1105,8 +1335,38 @@ export async function runWorkflow(
         if (filter && !filter(f)) continue;
         inputs.push({
           from: label,
+          ...(succ.instanceId ? { instanceId: succ.instanceId } : {}),
           name: f.name,
           path: join(upstreamOutputDir, f.path),
+          kind: f.kind,
+          preview: f.preview,
+        });
+      }
+    };
+
+    // Push every file of a manifest at a known (absolute) path — used for
+    // revisit feedback where the manifest is referenced directly off the
+    // nodeRevisitRequested event (requester / target-prior), not via a
+    // nodeSucceeded lookup.  Names are prefixed so the agent can tell the
+    // feedback pieces apart (`revisit/source:…`, `revisit/previous:…`).
+    // Journal stores runDir-relative revisit paths; resolve to absolute for read.
+    const resolveRunPath = (p: string): string => (isAbsolute(p) ? p : join(runDir, p));
+    const pushManifestByPath = (label: string, manifestPath: string | undefined, namePrefix: string): void => {
+      if (!manifestPath) return;
+      const abs = resolveRunPath(manifestPath);
+      if (!existsSync(abs)) return;
+      let manifest: Manifest;
+      try {
+        manifest = JSON.parse(readFileSync(abs, 'utf-8')) as Manifest;
+      } catch {
+        return;
+      }
+      const outDir = join(dirname(abs), 'work');
+      for (const f of manifest.files) {
+        inputs.push({
+          from: label,
+          name: `${namePrefix}:${f.name}`,
+          path: join(outDir, f.path),
           kind: f.kind,
           preview: f.preview,
         });
@@ -1131,6 +1391,23 @@ export async function runWorkflow(
     for (const ref of node.inputs) {
       if (omittedFrom.has(ref.from)) continue; // branch not taken — surfaced via `omitted`
       pushRef(ref);
+    }
+
+    // Cross-node revisit feedback: when THIS node is a revisit target, its fresh
+    // instance is sent back blind unless we hand it (1) WHY it was sent back,
+    // (2) the requester's output (where it went wrong), (3) its OWN prior output
+    // (so it edits rather than rewrites).  All as `from:"revisit"` inputs; the
+    // goal.txt instructs the agent to read them first.  A plain first run / a
+    // cone node that wasn't the target has no such event → nothing injected.
+    const revisitReq = [...events].reverse().find(
+      (e): e is StoredEvent & { type: 'nodeRevisitRequested' } =>
+        e.type === 'nodeRevisitRequested' && e.toNodeId === node.id);
+    if (revisitReq) {
+      if (revisitReq.reasonPath) {
+        inputs.push({ from: 'revisit', name: 'reason', path: resolveRunPath(revisitReq.reasonPath), kind: 'markdown', preview: revisitReq.reason });
+      }
+      pushManifestByPath('revisit', revisitReq.sourceManifestPath, 'source');
+      pushManifestByPath('revisit', revisitReq.targetPreviousManifestPath, 'previous');
     }
 
     if (loopRef) {

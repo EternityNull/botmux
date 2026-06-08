@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import {
   V3_BLOCKED_RETRY_ACTION,
   V3_BLOCKED_ASK_ANSWER_ACTION,
+  V3_BLOCKED_ASK_TEXT_FIELD,
   buildV3BlockedCard,
   v3BlockedCardNonce,
   type V3BlockedActionValue,
@@ -27,6 +28,12 @@ import { isValidRunId } from '../../workflows/v3/ops-projection.js';
 
 export function isV3BlockedAction(action: unknown): boolean {
   return action === V3_BLOCKED_RETRY_ACTION || action === V3_BLOCKED_ASK_ANSWER_ACTION;
+}
+
+function isV3AskAnswerValue(
+  value: V3BlockedActionValue | V3AskAnswerActionValue,
+): value is V3AskAnswerActionValue {
+  return value.action === V3_BLOCKED_ASK_ANSWER_ACTION;
 }
 
 export interface V3BlockedCardHandlerDeps {
@@ -48,10 +55,11 @@ export async function handleV3BlockedAction(
   value: V3BlockedActionValue | V3AskAnswerActionValue,
   operatorOpenId: string | undefined,
   deps: V3BlockedCardHandlerDeps,
+  formValue?: Record<string, string>,
 ): Promise<unknown> {
   // 同一张卡两条 action：普通重试 / human-ask 选项答题。后者额外带 selected，
   // 走同一条 requestV3Retry 通道（带 answer），只是冻结卡渲染不同。
-  const isAsk = value.action === V3_BLOCKED_ASK_ANSWER_ACTION;
+  const isAsk = isV3AskAnswerValue(value);
   const verb = isAsk ? '回答' : '重试';
   const baseDir = deps.baseDir ?? defaultBaseDir();
   if (!isValidRunId(value.runId)) {
@@ -71,16 +79,34 @@ export async function handleV3BlockedAction(
 
   const requestRetry = deps.requestRetry ?? requestV3Retry;
   let outcome;
+  let answer:
+    | { selected: string; by: string }
+    | { text: string; by: string }
+    | undefined;
   try {
+    const textAnswer =
+      isAsk && 'answerKind' in value && value.answerKind === 'text'
+        ? (formValue?.[V3_BLOCKED_ASK_TEXT_FIELD] ?? '').trim()
+        : undefined;
+    if (isAsk && 'answerKind' in value && value.answerKind === 'text' && !textAnswer) {
+      return { toast: { type: 'warning', content: '请先填写答案' } };
+    }
+    if (isAsk) {
+      if (textAnswer !== undefined) {
+        answer = { text: textAnswer, by: operatorOpenId ?? 'unknown' };
+      } else if ('selected' in value) {
+        answer = { selected: value.selected, by: operatorOpenId ?? 'unknown' };
+      } else {
+        return { toast: { type: 'warning', content: '这张卡已失效（答案类型不匹配）' } };
+      }
+    }
     // expectedAttemptId（codex blocker）：nonce 只证明这张卡自身没被改，证不了
     // 它指向的 attempt 还是"当前 blocked 的那个"——core 必须再比一次，否则
     // 001 的旧卡能把 002 的 blocked 推进到 003。
     outcome = requestRetry(baseDir, value.runId, {
       nodeId: value.nodeId,
       expectedAttemptId: value.attemptId,
-      ...(isAsk
-        ? { answer: { selected: value.selected, by: operatorOpenId ?? 'unknown' } }
-        : {}),
+      ...(answer ? { answer } : {}),
     });
   } catch (err) {
     return {
@@ -123,7 +149,9 @@ export async function handleV3BlockedAction(
         // 带上 ask 仅为在冻结卡里复现问题文案（answered 优先于 options 渲染）。
         ask: info.ask,
         answered: {
-          selected: (value as V3AskAnswerActionValue).selected,
+          ...(answer && 'text' in answer
+            ? { text: answer.text }
+            : { selected: answer?.selected ?? '' }),
           nextAttemptId: outcome.nextAttemptId,
           by: operatorOpenId,
         },

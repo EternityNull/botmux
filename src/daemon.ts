@@ -101,6 +101,7 @@ import { createV3GateRunner, requestV3Retry, requestV3LoopGrant } from './workfl
 import { buildV3GateCard } from './im/lark/v3-gate-card.js';
 import { buildV3BlockedCard } from './im/lark/v3-blocked-card.js';
 import { buildV3LoopGrantCard } from './im/lark/v3-loop-grant-card.js';
+import { buildV3RevisitGrantCard } from './im/lark/v3-revisit-grant-card.js';
 import { isValidRunId as isValidV3RunId } from './workflows/v3/ops-projection.js';
 import { readRunChatBinding as readV3RunChatBinding, defaultBaseDir as v3DefaultBaseDir } from './workflows/v3/grill-state.js';
 
@@ -1576,6 +1577,21 @@ const v3GateRunner = createV3GateRunner({
       await sendMessage(binding.larkAppId, binding.chatId, card, 'interactive');
     }
   },
+  postRevisitGrantCard: async (binding, info, runId) => {
+    const card = buildV3RevisitGrantCard({
+      runId,
+      sourceNodeId: info.sourceNodeId,
+      toNodeId: info.toNodeId,
+      tier: info.tier,
+      attemptId: info.attemptId,
+      detail: info.detail,
+    });
+    if (binding.rootMessageId) {
+      await sessionReply(binding.rootMessageId, card, 'interactive', binding.larkAppId);
+    } else {
+      await sendMessage(binding.larkAppId, binding.chatId, card, 'interactive');
+    }
+  },
   notifyTerminal: async (binding, runId, outcome) => {
     if (!binding?.rootMessageId) return;
     const msg = outcome.runStatus === 'succeeded'
@@ -1613,6 +1629,11 @@ const cardDeps: CardHandlerDeps = {
       binding ? canOperate(binding.larkAppId, binding.chatId, operatorOpenId) : false,
   },
   v3LoopGrantDeps: {
+    driveRun: (runId) => v3GateRunner.driveDetached(runId),
+    canResolve: (binding, operatorOpenId) =>
+      binding ? canOperate(binding.larkAppId, binding.chatId, operatorOpenId) : false,
+  },
+  v3RevisitGrantDeps: {
     driveRun: (runId) => v3GateRunner.driveDetached(runId),
     canResolve: (binding, operatorOpenId) =>
       binding ? canOperate(binding.larkAppId, binding.chatId, operatorOpenId) : false,

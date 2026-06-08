@@ -13,6 +13,7 @@ import {
   v3BlockedCardNonce,
   V3_BLOCKED_RETRY_ACTION,
   V3_BLOCKED_ASK_ANSWER_ACTION,
+  V3_BLOCKED_ASK_TEXT_FIELD,
   type V3BlockedActionValue,
   type V3AskAnswerActionValue,
 } from '../src/im/lark/v3-blocked-card.js';
@@ -92,6 +93,29 @@ describe('buildV3BlockedCard', () => {
     expect(JSON.stringify(card)).not.toContain(V3_BLOCKED_RETRY_ACTION);
   });
 
+  it('ask 自由文本卡：blue header + 输入框 + 提交按钮（value 不携带文本）', () => {
+    const card = JSON.parse(buildV3BlockedCard({
+      ...INPUT,
+      ask: { question: '请补充计费规则', freeText: true },
+    }));
+    expect(card.header.template).toBe('blue');
+    expect(JSON.stringify(card)).toContain('请补充计费规则');
+    const formEl = card.elements.find((e: any) => e.tag === 'form');
+    expect(formEl.elements.find((e: any) => e.tag === 'input').name).toBe(V3_BLOCKED_ASK_TEXT_FIELD);
+    const submit = formEl.elements.find((e: any) => e.tag === 'button');
+    const value = submit.value as V3AskAnswerActionValue;
+    expect(value).toMatchObject({
+      action: V3_BLOCKED_ASK_ANSWER_ACTION,
+      runId: INPUT.runId,
+      nodeId: 'deploy',
+      attemptId: 'deploy/attempts/001',
+      answerKind: 'text',
+      nonce: v3BlockedCardNonce(INPUT.runId, 'deploy', 'deploy/attempts/001'),
+    });
+    expect(JSON.stringify(value)).not.toContain('计费');
+    expect(JSON.stringify(card)).not.toContain(V3_BLOCKED_RETRY_ACTION);
+  });
+
   it('answered 冻结卡：green + 无选项按钮 + 显示选中项与新 attempt', () => {
     const card = JSON.parse(buildV3BlockedCard({
       ...INPUT,
@@ -101,6 +125,19 @@ describe('buildV3BlockedCard', () => {
     expect(card.header.template).toBe('green');
     const json = JSON.stringify(card);
     expect(json).toContain('prod');
+    expect(json).toContain('002');
+    expect(json).not.toContain(V3_BLOCKED_ASK_ANSWER_ACTION);
+  });
+
+  it('answered 自由文本冻结卡：green + 显示文本预览与新 attempt', () => {
+    const card = JSON.parse(buildV3BlockedCard({
+      ...INPUT,
+      ask: { question: '请补充计费规则', freeText: true },
+      answered: { text: '超过 30 天按自然月计费', nextAttemptId: 'deploy/attempts/002', by: 'ou_x' },
+    }));
+    expect(card.header.template).toBe('green');
+    const json = JSON.stringify(card);
+    expect(json).toContain('超过 30 天');
     expect(json).toContain('002');
     expect(json).not.toContain(V3_BLOCKED_ASK_ANSWER_ACTION);
   });
@@ -215,6 +252,55 @@ describe('handleV3BlockedAction', () => {
     // 重试事件带 answer 指针
     const retryEvt: any = readJournal(journalPath).find((e) => e.type === 'nodeRetryRequested');
     expect(retryEvt.answer).toMatchObject({ preview: 'prod', by: 'ou_op' });
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  it('ask 自由文本提交 → 原子写 answer.json + nodeRetryRequested.answer + 冻结「已回答」卡 + driveRun', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-blocked-card-'));
+    const runId = 'ask-260606-0002';
+    const { runDir } = birthRun({
+      goal: 'g', baseDir: base, runId,
+      chatBinding: { larkAppId: 'cli_test', chatId: 'oc_chat', rootMessageId: 'om_root' },
+    });
+    const journalPath = join(runDir, 'journal.ndjson');
+    mkdirSync(join(runDir, 'deploy', 'attempts', '001'), { recursive: true });
+    appendEvent(journalPath, { type: 'runStarted', runId });
+    appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'deploy', attemptId: 'deploy/attempts/001' });
+    appendEvent(journalPath, {
+      type: 'nodeBlocked', nodeId: 'deploy', attemptId: 'deploy/attempts/001',
+      errorClass: 'manifestInvalid', errorCode: ASK_HUMAN_ERROR_CODE, message: '请补充计费规则',
+      ask: { question: '请补充计费规则', freeText: true },
+    });
+    appendEvent(journalPath, { type: 'runBlocked', blockedNodeId: 'deploy' });
+
+    const askValue: V3AskAnswerActionValue = {
+      action: V3_BLOCKED_ASK_ANSWER_ACTION,
+      runId, nodeId: 'deploy', attemptId: 'deploy/attempts/001',
+      answerKind: 'text',
+      nonce: v3BlockedCardNonce(runId, 'deploy', 'deploy/attempts/001'),
+    };
+    const longAnswer = `超过 30 天按自然月计费。${'计费边界说明'.repeat(40)}`;
+    const driveRun = vi.fn();
+    const res: any = await handleV3BlockedAction(
+      askValue,
+      'ou_op',
+      { baseDir: base, driveRun },
+      { [V3_BLOCKED_ASK_TEXT_FIELD]: longAnswer },
+    );
+
+    expect(driveRun).toHaveBeenCalledWith(runId);
+    expect(res.header.template).toBe('green');
+    expect(JSON.stringify(res)).toContain('超过 30 天');
+
+    const answerPath = join(runDir, 'deploy', 'attempts', '001', GOAL_ANSWER_FILE);
+    const answer = JSON.parse(readFileSync(answerPath, 'utf-8'));
+    expect(answer).toMatchObject({ text: longAnswer, by: 'ou_op' });
+
+    const retryEvt: any = readJournal(journalPath).find((e) => e.type === 'nodeRetryRequested');
+    expect(retryEvt.answer.by).toBe('ou_op');
+    expect(retryEvt.answer.preview).toContain('超过 30 天');
+    expect(retryEvt.answer.preview.length).toBeLessThan(longAnswer.length);
+    expect(retryEvt.answer.preview.length).toBeLessThanOrEqual(203);
     rmSync(base, { recursive: true, force: true });
   });
 

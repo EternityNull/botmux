@@ -23,6 +23,7 @@ import {
   nextAttemptIdFor,
   latestAttemptIdFor,
   renderGoalFile,
+  readGoalAsk,
   type V3RuntimeDeps,
 } from '../src/workflows/v3/runtime.js';
 import { requestV3Retry, reconcileV3PendingGates, blockedInfoFor } from '../src/workflows/v3/daemon-run.js';
@@ -95,6 +96,34 @@ describe('classifyTerminal', () => {
     expect(classifyTerminal('workerError', { selfReportedFail: true, retryable: false })).toBe('failed');
     expect(classifyTerminal('workerError', { selfReportedFail: true, retryable: true })).toBe('blocked');
     expect(classifyTerminal('workerError', { selfReportedFail: true })).toBe('blocked');
+  });
+});
+
+describe('readGoalAsk', () => {
+  it('accepts option asks and free-text asks', () => {
+    const base = freshBase();
+    try {
+      const optionPath = join(base, 'option-ask.json');
+      writeFileSync(optionPath, JSON.stringify({ question: '部署到哪里？', options: ['staging', 'prod'] }));
+      expect(readGoalAsk(optionPath)).toEqual({ question: '部署到哪里？', options: ['staging', 'prod'] });
+
+      const textPath = join(base, 'text-ask.json');
+      writeFileSync(textPath, JSON.stringify({ question: '补充计费规则', freeText: true }));
+      expect(readGoalAsk(textPath)).toEqual({ question: '补充计费规则', freeText: true });
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects ambiguous asks', () => {
+    const base = freshBase();
+    try {
+      const badPath = join(base, 'bad-ask.json');
+      writeFileSync(badPath, JSON.stringify({ question: '补充计费规则', freeText: true, options: ['A', 'B'] }));
+      expect(readGoalAsk(badPath)).toBeUndefined();
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 });
 
@@ -264,9 +293,9 @@ describe('requestV3Retry + 重驱动全链路', () => {
     writeGrillState(runDir, { ...state, status: 'dag_approved', dagPath });
     const journalPath = join(runDir, 'journal.ndjson');
     appendEvent(journalPath, { type: 'runStarted', runId });
-    appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'work', attemptId: 'work/attempts/001' });
+    appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'work', instanceId: 'work#001', attemptId: 'work#001/attempts/001' });
     appendEvent(journalPath, {
-      type: 'nodeBlocked', nodeId: 'work', attemptId: 'work/attempts/001',
+      type: 'nodeBlocked', nodeId: 'work', instanceId: 'work#001', attemptId: 'work#001/attempts/001',
       errorClass: 'workerError', errorCode: 'AUTH_REQUIRED', message: '需要登录',
     });
     appendEvent(journalPath, { type: 'runBlocked', blockedNodeId: 'work' });
@@ -278,7 +307,7 @@ describe('requestV3Retry + 重驱动全链路', () => {
     const { journalPath } = seedBlockedRun(base, 'retry-001');
 
     const out = requestV3Retry(base, 'retry-001');
-    expect(out).toMatchObject({ kind: 'requested', nodeId: 'work', nextAttemptId: 'work/attempts/002' });
+    expect(out).toMatchObject({ kind: 'requested', nodeId: 'work', nextAttemptId: 'work#001/attempts/002' });
 
     // 防 Blocker1 回归：fresh replay 必须得出 pending（解锁在 journal 里）。
     const snap = materialize(readJournal(journalPath));
@@ -294,7 +323,7 @@ describe('requestV3Retry + 重驱动全链路', () => {
       (await import('node:fs')).readFileSync(join(base, 'retry-001', 'dag.json'), 'utf-8'),
     ));
     const runNode: RunNode = async (req) => {
-      expect(req.attemptId).toBe('work/attempts/002');
+      expect(req.attemptId).toBe('work#001/attempts/002');
       const m: Manifest = {
         schemaVersion: 1, status: 'ok', summary: 'done',
         files: [product(req.outputDir, 'out.md', 'ok')],
@@ -327,29 +356,29 @@ describe('requestV3Retry + 重驱动全链路', () => {
   it('stale 旧卡（codex blocker）：001 的卡不能把 002 的 blocked 推进到 003', () => {
     const base = freshBase();
     const { journalPath } = seedBlockedRun(base, 'retry-005');
-    // 001 blocked → 点卡 retry → 002 跑 → 002 又 blocked
-    expect(requestV3Retry(base, 'retry-005', { expectedAttemptId: 'work/attempts/001' }).kind).toBe('requested');
-    appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'work', attemptId: 'work/attempts/002' });
+    // 001 blocked → 点卡 retry → 002 跑 → 002 又 blocked（全在同一 instance work#001 内）
+    expect(requestV3Retry(base, 'retry-005', { expectedAttemptId: 'work#001/attempts/001' }).kind).toBe('requested');
+    appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'work', instanceId: 'work#001', attemptId: 'work#001/attempts/002' });
     appendEvent(journalPath, {
-      type: 'nodeBlocked', nodeId: 'work', attemptId: 'work/attempts/002',
+      type: 'nodeBlocked', nodeId: 'work', instanceId: 'work#001', attemptId: 'work#001/attempts/002',
       errorClass: 'workerError', errorCode: 'AUTH_REQUIRED', message: '还是要登录',
     });
     appendEvent(journalPath, { type: 'runBlocked', blockedNodeId: 'work' });
 
     // 用 001 的旧卡点击 → stale-attempt，绝不 append 003
-    const stale = requestV3Retry(base, 'retry-005', { nodeId: 'work', expectedAttemptId: 'work/attempts/001' });
+    const stale = requestV3Retry(base, 'retry-005', { nodeId: 'work', expectedAttemptId: 'work#001/attempts/001' });
     expect(stale).toMatchObject({ kind: 'stale-run', reason: 'stale-attempt' });
     expect(readJournal(journalPath).filter((e) => e.type === 'nodeRetryRequested')).toHaveLength(1);
 
     // 当前卡（002）/ CLI（不带 expectedAttemptId）仍可重试
-    const fresh = requestV3Retry(base, 'retry-005', { nodeId: 'work', expectedAttemptId: 'work/attempts/002' });
-    expect(fresh).toMatchObject({ kind: 'requested', nextAttemptId: 'work/attempts/003' });
+    const fresh = requestV3Retry(base, 'retry-005', { nodeId: 'work', expectedAttemptId: 'work#001/attempts/002' });
+    expect(fresh).toMatchObject({ kind: 'requested', nextAttemptId: 'work#001/attempts/003' });
 
     // 预留未消费期间，001 旧卡点进 pending 分支也必须 stale（不是 already-requested）
-    const staleOnPending = requestV3Retry(base, 'retry-005', { nodeId: 'work', expectedAttemptId: 'work/attempts/001' });
+    const staleOnPending = requestV3Retry(base, 'retry-005', { nodeId: 'work', expectedAttemptId: 'work#001/attempts/001' });
     expect(staleOnPending).toMatchObject({ kind: 'stale-run', reason: 'stale-attempt' });
     // 002 的卡在预留未消费期间重复点 → already-requested（幂等）
-    expect(requestV3Retry(base, 'retry-005', { nodeId: 'work', expectedAttemptId: 'work/attempts/002' }).kind).toBe('already-requested');
+    expect(requestV3Retry(base, 'retry-005', { nodeId: 'work', expectedAttemptId: 'work#001/attempts/002' }).kind).toBe('already-requested');
     rmSync(base, { recursive: true, force: true });
   });
 
@@ -360,14 +389,14 @@ describe('requestV3Retry + 重驱动全链路', () => {
     // 普通 blocked 节点没有 ask payload，不能通过伪造 ask action 注入 answer。
     const forged = requestV3Retry(base, 'retry-006', {
       nodeId: 'work',
-      expectedAttemptId: 'work/attempts/001',
+      expectedAttemptId: 'work#001/attempts/001',
       answer: { selected: 'prod', by: 'ou_op' },
     });
     expect(forged).toMatchObject({ kind: 'stale-run', reason: 'invalid-answer' });
     expect(readJournal(journalPath).filter((e) => e.type === 'nodeRetryRequested')).toHaveLength(0);
 
     appendEvent(journalPath, {
-      type: 'nodeBlocked', nodeId: 'work', attemptId: 'work/attempts/001',
+      type: 'nodeBlocked', nodeId: 'work', instanceId: 'work#001', attemptId: 'work#001/attempts/001',
       errorClass: 'manifestInvalid', errorCode: 'ASK_HUMAN', message: '部署到哪里？',
       ask: { question: '部署到哪里？', options: ['staging', 'prod'] },
     });
@@ -375,7 +404,7 @@ describe('requestV3Retry + 重驱动全链路', () => {
 
     const invalid = requestV3Retry(base, 'retry-006', {
       nodeId: 'work',
-      expectedAttemptId: 'work/attempts/001',
+      expectedAttemptId: 'work#001/attempts/001',
       answer: { selected: 'dev', by: 'ou_op' },
     });
     expect(invalid).toMatchObject({ kind: 'stale-run', reason: 'invalid-answer' });
@@ -383,10 +412,10 @@ describe('requestV3Retry + 重驱动全链路', () => {
 
     const valid = requestV3Retry(base, 'retry-006', {
       nodeId: 'work',
-      expectedAttemptId: 'work/attempts/001',
+      expectedAttemptId: 'work#001/attempts/001',
       answer: { selected: 'prod', by: 'ou_op' },
     });
-    expect(valid).toMatchObject({ kind: 'requested', nextAttemptId: 'work/attempts/002' });
+    expect(valid).toMatchObject({ kind: 'requested', nextAttemptId: 'work#001/attempts/002' });
     rmSync(base, { recursive: true, force: true });
   });
 
@@ -413,7 +442,7 @@ describe('requestV3Retry + 重驱动全链路', () => {
     const base = freshBase();
     const { journalPath } = seedBlockedRun(base, 'retry-004');
     const info = blockedInfoFor(readJournal(journalPath), 'work');
-    expect(info).toMatchObject({ nodeId: 'work', attemptId: 'work/attempts/001', errorCode: 'AUTH_REQUIRED' });
+    expect(info).toMatchObject({ nodeId: 'work', attemptId: 'work#001/attempts/001', errorCode: 'AUTH_REQUIRED' });
     rmSync(base, { recursive: true, force: true });
   });
 });

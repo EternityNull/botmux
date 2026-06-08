@@ -38,6 +38,12 @@ import {
   type V3LoopGrantCardHandlerDeps,
 } from './v3-loop-grant-card-handler.js';
 import type { V3LoopGrantActionValue } from './v3-loop-grant-card.js';
+import {
+  handleV3RevisitGrantAction,
+  isV3RevisitGrantAction,
+  type V3RevisitGrantCardHandlerDeps,
+} from './v3-revisit-grant-card-handler.js';
+import type { V3RevisitGrantActionValue } from './v3-revisit-grant-card.js';
 import { handleAskCardAction, isAskCardAction } from './ask-card.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { logger } from '../../utils/logger.js';
@@ -67,6 +73,8 @@ export interface CardHandlerDeps {
   v3BlockedDeps?: V3BlockedCardHandlerDeps;
   /** v3 loop 追加一轮卡点击处理（同一个 runner 的 driveRun）. */
   v3LoopGrantDeps?: V3LoopGrantCardHandlerDeps;
+  /** v3 回溯预算准许卡点击处理（同一个 runner 的 driveRun）. */
+  v3RevisitGrantDeps?: V3RevisitGrantCardHandlerDeps;
 }
 
 interface CardActionData {
@@ -606,7 +614,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   }
   if (isV3BlockedAction(value?.action)) {
     if (!deps.v3BlockedDeps) return;
-    return await handleV3BlockedAction(value as unknown as V3BlockedActionValue | V3AskAnswerActionValue, operatorOpenId, deps.v3BlockedDeps);
+    return await handleV3BlockedAction(
+      value as unknown as V3BlockedActionValue | V3AskAnswerActionValue,
+      operatorOpenId,
+      deps.v3BlockedDeps,
+      action?.form_value,
+    );
+  }
+  if (isV3RevisitGrantAction(value?.action)) {
+    if (!deps.v3RevisitGrantDeps) return;
+    return await handleV3RevisitGrantAction(value as unknown as V3RevisitGrantActionValue, operatorOpenId, deps.v3RevisitGrantDeps);
   }
   if (isV3LoopGrantAction(value?.action)) {
     if (!deps.v3LoopGrantDeps) return;

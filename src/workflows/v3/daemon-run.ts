@@ -16,8 +16,8 @@
  * concurrent clicks / start can't double-spawn.
  */
 
-import { join } from 'node:path';
-import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
 import { isLoopNode, loadDag } from './dag.js';
@@ -25,6 +25,7 @@ import {
   runWorkflow,
   nextAttemptIdFor,
   latestAttemptIdFor,
+  revisitBudgetStatus,
   type V3RuntimeDeps,
   type V3RuntimeOptions,
   type V3RunOutcome,
@@ -50,7 +51,7 @@ import {
 import { readJournal, appendEvent, type StoredEvent, type V3ErrorClass } from './journal.js';
 import { materialize } from './state.js';
 import { isValidRunId } from './ops-projection.js';
-import { GOAL_ANSWER_FILE, type GoalAnswer, type ValidateManifest } from './contract.js';
+import { GOAL_ANSWER_FILE, type GoalAnswer, type GoalAsk, type ValidateManifest } from './contract.js';
 
 /**
  * runId → runDir with a path-traversal guard (codex review #2).  runIds reach
@@ -72,9 +73,12 @@ export interface V3BlockedInfo {
   errorCode?: string;
   message?: string;
   /** Present when the block is a runtime human-ask (errorCode === ASK_HUMAN):
-   *  the agent's question + options → the daemon posts an ask card (option
-   *  buttons) instead of a plain retry card. */
-  ask?: { question: string; options: string[] };
+   *  the agent's question → the daemon posts an ask card instead of a plain
+   *  retry card. */
+  ask?: GoalAsk;
+  /** Present when errorCode === 'REVISIT_BUDGET_EXHAUSTED': the ancestor this
+   *  node tried to revisit → the daemon posts a revisit-grant card. */
+  revisitTo?: string;
 }
 
 /** Latest `nodeBlocked` details for a node (card content).  Falls back to a
@@ -91,10 +95,40 @@ export function blockedInfoFor(events: StoredEvent[], nodeId: string): V3Blocked
         errorCode: e.errorCode,
         message: e.message,
         ...(e.ask ? { ask: e.ask } : {}),
+        ...(e.revisitTo ? { revisitTo: e.revisitTo } : {}),
       };
     }
   }
   return found ?? { nodeId, attemptId: latestAttemptIdFor(events, nodeId) ?? `${nodeId}/attempts/001` };
+}
+
+/** What the daemon needs to render a revisit-budget grant card.  Derived from
+ *  the blocked event (source/target/attempt) + a re-run budget check (which tier
+ *  is exhausted — the card must grant the RIGHT scope, 菲菲 review).  Returns
+ *  undefined when `nodeId` isn't actually blocked on REVISIT_BUDGET_EXHAUSTED. */
+export interface V3RevisitBudgetBlockedInfo {
+  sourceNodeId: string;
+  toNodeId: string;
+  attemptId: string;
+  tier: 'pair' | 'run';
+  detail: string;
+}
+export function revisitBudgetBlockedInfoFor(
+  events: StoredEvent[],
+  nodeId: string,
+): V3RevisitBudgetBlockedInfo | undefined {
+  const info = blockedInfoFor(events, nodeId);
+  if (info.errorCode !== 'REVISIT_BUDGET_EXHAUSTED' || !info.revisitTo) return undefined;
+  const status = revisitBudgetStatus(events, nodeId, info.revisitTo);
+  // Exhausted at block time; if a grant already lifted it the card is stale —
+  // fall back to 'pair' tier + the recorded message for a still-renderable card.
+  return {
+    sourceNodeId: nodeId,
+    toNodeId: info.revisitTo,
+    attemptId: info.attemptId,
+    tier: status.ok ? 'pair' : status.tier,
+    detail: status.ok ? (info.message ?? 'revisit budget') : status.detail,
+  };
 }
 
 /** What the daemon needs to render an exhausted-loop grant card. */
@@ -137,6 +171,10 @@ export interface V3DaemonRunDeps {
   /** Post an exhausted-loop grant card (+1 iteration).  Optional — same
    *  fallthrough semantics as postBlockedCard. */
   postLoopGrantCard?: (binding: RunChatBinding, info: V3LoopExhaustedInfo, runId: string) => Promise<void>;
+  /** Post a revisit-budget grant card (+1 revisit).  Optional — same fallthrough
+   *  semantics as postBlockedCard.  Chosen over the plain blocked card when the
+   *  block is a `REVISIT_BUDGET_EXHAUSTED`. */
+  postRevisitGrantCard?: (binding: RunChatBinding, info: V3RevisitBudgetBlockedInfo, runId: string) => Promise<void>;
   /** Report a terminal run (final card / message).  Optional. */
   onTerminal?: (runId: string, outcome: V3TerminalOutcome, binding?: RunChatBinding) => Promise<void>;
   maxParallel?: number;
@@ -206,11 +244,15 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
     //   - blocked node/instance (contract failure) → retry card (new attempt).
     const events = readJournal(join(runDir, 'journal.ndjson'));
     const isLoop = materialize(events).loops.has(outcome.blockedNodeId);
+    const revisitBudget = revisitBudgetBlockedInfoFor(events, outcome.blockedNodeId);
     if (isLoop && deps.postLoopGrantCard) {
       const info = loopExhaustedInfoFor(events, outcome.blockedNodeId);
       const loopNode = dag.nodes.find((n) => n.id === outcome.blockedNodeId);
       if (loopNode && isLoopNode(loopNode)) info.maxIterations = loopNode.maxIterations;
       await deps.postLoopGrantCard(binding, info, runId);
+    } else if (revisitBudget && deps.postRevisitGrantCard) {
+      // Revisit budget exhausted → grant card (+1 revisit), not a plain retry.
+      await deps.postRevisitGrantCard(binding, revisitBudget, runId);
     } else if (!isLoop && deps.postBlockedCard) {
       await deps.postBlockedCard(binding, blockedInfoFor(events, outcome.blockedNodeId), runId);
     } else {
@@ -269,17 +311,25 @@ export function resolveV3GateClick(
   if (snap.nodes.get(wait.nodeId)?.status !== 'gateWaiting') {
     return { kind: 'stale-run', reason: 'stale-node' };
   }
+  // Stale-card guard: the wait must belong to the node's CURRENT effective
+  // instance.  A revisit makes a fresh instance + gate (`A#002-gate`); an old
+  // `A#001-gate` card must NOT resolve the new instance's gate.
+  if (wait.instanceId && wait.instanceId !== snap.nodes.get(wait.nodeId)?.effectiveInstanceId) {
+    return { kind: 'stale-run', reason: 'stale-node' };
+  }
   if (!canResolveGateWait(wait, input.by)) return { kind: 'unauthorized' };
   const resolution = selectedResolution(wait, input.selected);
   if (!resolution) return { kind: 'stale-run', reason: 'no-wait' };
 
   resolveWait(runDir, input.waitId, resolution, input.by, input.selected);
+  const instanceId = snap.nodes.get(wait.nodeId)?.effectiveInstanceId;
   appendEvent(journalPath, {
     type: 'gateResolved',
     // nodeId from the WAIT FILE, not caller input (codex review #1): the wait is
     // the authoritative state — a wrong/stale caller nodeId must not let us write
     // gateResolved for a different node.
     nodeId: wait.nodeId,
+    ...(instanceId ? { instanceId } : {}),
     waitId: input.waitId,
     resolution,
     by: input.by,
@@ -292,6 +342,25 @@ export type V3RetryOutcome =
   | { kind: 'requested'; nodeId: string; previousAttemptId: string; nextAttemptId: string }
   | { kind: 'already-requested'; nodeId: string }
   | { kind: 'stale-run'; reason: 'missing' | 'not-blocked' | 'stale-attempt' | 'loop-node' | 'invalid-answer' };
+
+type V3RetryAnswerInput =
+  | { selected: string; by: string }
+  | { text: string; by: string };
+
+function atomicWriteJson(path: string, value: unknown): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, JSON.stringify(value, null, 2));
+  renameSync(tmp, path);
+}
+
+const HUMAN_ANSWER_PREVIEW_MAX_CHARS = 200;
+
+function answerPreview(s: string): string {
+  return s.length <= HUMAN_ANSWER_PREVIEW_MAX_CHARS
+    ? s
+    : `${s.slice(0, HUMAN_ANSWER_PREVIEW_MAX_CHARS)}...`;
+}
 
 /**
  * Append a retry intent for a blocked node (the resume entrypoint — daemon
@@ -315,7 +384,7 @@ export type V3RetryOutcome =
 export function requestV3Retry(
   baseDir: string,
   runId: string,
-  input: { nodeId?: string; expectedAttemptId?: string; answer?: { selected: string; by: string } } = {},
+  input: { nodeId?: string; expectedAttemptId?: string; answer?: V3RetryAnswerInput } = {},
 ): V3RetryOutcome {
   const runDir = safeRunDir(baseDir, runId);
   const journalPath = join(runDir, 'journal.ndjson');
@@ -326,10 +395,11 @@ export function requestV3Retry(
   // Target resolution: explicit nodeId > the run's blocked pointer > a node
   // with an unconsumed retry reservation (a prior retry already cleared the
   // blocked pointer — the idempotent repeat-call path).
+  const retryKeyFor = (id: string): string => snap.nodes.get(id)?.effectiveInstanceId ?? id;
   const nodeId =
     input.nodeId ??
     snap.blockedNodeId ??
-    [...snap.nodes.keys()].find((id) => unconsumedRetryEvent(events, id) !== undefined);
+    [...snap.nodes.keys()].find((id) => unconsumedRetryEvent(events, retryKeyFor(id)) !== undefined);
   if (!nodeId) return { kind: 'stale-run', reason: 'not-blocked' };
   // An exhausted LOOP blocks the run too, but "retry an attempt" is the wrong
   // verb for it — the recovery is a grant (+1 iteration).  Route loudly.
@@ -339,7 +409,7 @@ export function requestV3Retry(
   if (status === 'pending') {
     // An unconsumed retry reservation already reset this node — idempotent
     // no-op (a second click / a CLI retry racing the card must not double-append).
-    const pendingRetry = unconsumedRetryEvent(events, nodeId);
+    const pendingRetry = unconsumedRetryEvent(events, retryKeyFor(nodeId));
     if (pendingRetry) {
       // The repeat-call is only "the same retry" when it references the attempt
       // that retry was FOR — a stale older card is not an idempotent repeat.
@@ -352,7 +422,13 @@ export function requestV3Retry(
   }
   if (status !== 'blocked') return { kind: 'stale-run', reason: 'not-blocked' };
 
-  const previousAttemptId = latestAttemptIdFor(events, nodeId);
+  // Constraint 5: a retry stays in the SAME instance — key attempt numbering by
+  // the blocked node's effective instance (`A#001`), not the bare nodeId, so the
+  // new attempt is `A#001/attempts/002` (NOT a new instance).  Legacy runs with
+  // no instance fall back to nodeId.
+  const instanceId = snap.nodes.get(nodeId)?.effectiveInstanceId;
+  const attemptKey = instanceId ?? nodeId;
+  const previousAttemptId = latestAttemptIdFor(events, attemptKey);
   if (!previousAttemptId) return { kind: 'stale-run', reason: 'not-blocked' };
   const info = blockedInfoFor(events, nodeId);
   // Freshness gate (codex blocker): the click must target the CURRENTLY
@@ -360,7 +436,7 @@ export function requestV3Retry(
   if (input.expectedAttemptId && input.expectedAttemptId !== info.attemptId) {
     return { kind: 'stale-run', reason: 'stale-attempt' };
   }
-  const nextAttemptId = nextAttemptIdFor(events, nodeId);
+  const nextAttemptId = nextAttemptIdFor(events, attemptKey);
 
   // Runtime human-ask answer: persist the chosen option next to the asked
   // attempt (answer.json) and carry its path on the retry event — buildInputs
@@ -370,19 +446,35 @@ export function requestV3Retry(
   // freshness/integrity but not that `selected` is one of the authored options.
   let answer: { path: string; preview: string; by: string } | undefined;
   if (input.answer) {
-    if (!info.ask || !info.ask.options.includes(input.answer.selected)) {
+    if (!info.ask) {
       return { kind: 'stale-run', reason: 'invalid-answer' };
     }
+    if ('selected' in input.answer) {
+      if (info.ask.freeText === true || !info.ask.options.includes(input.answer.selected)) {
+        return { kind: 'stale-run', reason: 'invalid-answer' };
+      }
+    } else {
+      if (info.ask.freeText !== true || input.answer.text.trim() === '') {
+        return { kind: 'stale-run', reason: 'invalid-answer' };
+      }
+    }
     const answerPath = join(runDir, previousAttemptId, GOAL_ANSWER_FILE);
-    const payload: GoalAnswer = { selected: input.answer.selected, by: input.answer.by };
-    mkdirSync(join(runDir, previousAttemptId), { recursive: true });
-    writeFileSync(answerPath, JSON.stringify(payload, null, 2));
-    answer = { path: answerPath, preview: input.answer.selected, by: input.answer.by };
+    const payload: GoalAnswer =
+      'text' in input.answer
+        ? { text: input.answer.text, by: input.answer.by }
+        : { selected: input.answer.selected, by: input.answer.by };
+    atomicWriteJson(answerPath, payload);
+    answer = {
+      path: answerPath,
+      preview: answerPreview('text' in payload ? payload.text : payload.selected),
+      by: payload.by,
+    };
   }
 
   appendEvent(journalPath, {
     type: 'nodeRetryRequested',
     nodeId,
+    ...(instanceId ? { instanceId } : {}),
     previousAttemptId,
     nextAttemptId,
     reason: 'blockedRetry',
@@ -391,6 +483,75 @@ export function requestV3Retry(
     ...(answer ? { answer } : {}),
   });
   return { kind: 'requested', nodeId, previousAttemptId, nextAttemptId };
+}
+
+export type V3RevisitGrantOutcome =
+  | { kind: 'granted'; scope: 'pair' | 'run'; retry: V3RetryOutcome }
+  | { kind: 'invalid'; reason: 'partial-pair' | 'pair-source-mismatch' }
+  | { kind: 'stale-run'; reason: 'missing' | 'not-budget-blocked' | 'stale-attempt' };
+
+/** Grant +1 revisit budget after a run blocked on `REVISIT_BUDGET_EXHAUSTED`,
+ *  then resume (the revisit analogue of a loop-iteration grant).  Atomic
+ *  "continue": append `revisitBudgetGranted` AND retry the blocked node so it
+ *  re-attempts its revisit within the extended budget — one entry, like the
+ *  card's one-click.  Guards (菲菲 review):
+ *   - the run MUST currently be blocked on a `REVISIT_BUDGET_EXHAUSTED` node
+ *     (freshness + idempotency: after grant+retry the node is pending, so a
+ *     repeat call is `not-budget-blocked` and adds NO further budget);
+ *   - PAIR grant ⇒ both sourceNodeId+toNodeId, and sourceNodeId MUST be the
+ *     blocked node; RUN grant ⇒ neither; a half-filled pair is rejected (never
+ *     silently widened to a run grant);
+ *   - `expectedAttemptId` (card passes it) must match the blocked attempt. */
+export function requestRevisitGrant(
+  baseDir: string,
+  runId: string,
+  input: { sourceNodeId?: string; toNodeId?: string; by: string; reason?: string; expectedAttemptId?: string },
+): V3RevisitGrantOutcome {
+  const runDir = safeRunDir(baseDir, runId);
+  const journalPath = join(runDir, 'journal.ndjson');
+  if (!existsSync(journalPath)) return { kind: 'stale-run', reason: 'missing' };
+
+  // Reject a half-filled pair before touching state (never widen to run grant).
+  const hasSource = input.sourceNodeId !== undefined;
+  const hasTo = input.toNodeId !== undefined;
+  if (hasSource !== hasTo) return { kind: 'invalid', reason: 'partial-pair' };
+  const pair = hasSource && hasTo;
+
+  // Freshness: must currently be blocked on a budget-exhausted node.
+  const events = readJournal(journalPath);
+  const snap = materialize(events);
+  const blockedNodeId = snap.blockedNodeId;
+  if (!blockedNodeId) return { kind: 'stale-run', reason: 'not-budget-blocked' };
+  const info = blockedInfoFor(events, blockedNodeId);
+  if (info.errorCode !== 'REVISIT_BUDGET_EXHAUSTED') return { kind: 'stale-run', reason: 'not-budget-blocked' };
+  if (input.expectedAttemptId && input.expectedAttemptId !== info.attemptId) {
+    return { kind: 'stale-run', reason: 'stale-attempt' };
+  }
+  // A pair grant must target the blocked node as its source.
+  if (pair && input.sourceNodeId !== blockedNodeId) return { kind: 'invalid', reason: 'pair-source-mismatch' };
+
+  // Recovery-safe grant (code review): the node can be blocked on
+  // REVISIT_BUDGET_EXHAUSTED yet have budget ALREADY ok — that's the crash
+  // window where a prior call appended `revisitBudgetGranted` but died before the
+  // retry.  Re-granting there would double the budget for one approval.  So only
+  // append the grant while the budget is STILL exhausted; otherwise just resume
+  // (retry) the half-applied grant.  Both paths are idempotent: after the retry
+  // the node is pending, so a further click is `not-budget-blocked`.
+  const stillExhausted = info.revisitTo
+    ? !revisitBudgetStatus(events, blockedNodeId, info.revisitTo).ok
+    : true; // no recorded target → can't re-check; treat as exhausted (append once)
+  if (stillExhausted) {
+    appendEvent(journalPath, {
+      type: 'revisitBudgetGranted',
+      ...(pair ? { sourceNodeId: input.sourceNodeId, toNodeId: input.toNodeId } : {}),
+      by: input.by,
+      ...(input.reason ? { reason: input.reason } : {}),
+    });
+  }
+  // Resume: retry the blocked node so it re-runs and re-requests its revisit
+  // within the now-extended budget (reuses requestV3Retry's idempotency/guards).
+  const retry = requestV3Retry(baseDir, runId, { nodeId: blockedNodeId, expectedAttemptId: info.attemptId });
+  return { kind: 'granted', scope: pair ? 'pair' : 'run', retry };
 }
 
 export type V3LoopGrantOutcome =
@@ -448,16 +609,19 @@ export function requestV3LoopGrant(
   return { kind: 'granted', loopId, fromIteration: ls.iteration, nextIteration: ls.iteration + 1 };
 }
 
-/** The node's `nodeRetryRequested` whose reserved attempt has not yet been
- *  consumed by a matching `nodeDispatched` (undefined when none pending). */
+/** The `nodeRetryRequested` for `key` whose reserved attempt has not yet been
+ *  consumed by a matching `nodeDispatched` (undefined when none pending).  `key`
+ *  matches by `(instanceId ?? nodeId)` so a stale retry on an OLD instance isn't
+ *  mistaken for the current instance's pending retry (constraint 5 / review #3). */
 function unconsumedRetryEvent(
   events: StoredEvent[],
-  nodeId: string,
+  key: string,
 ): Extract<StoredEvent, { type: 'nodeRetryRequested' }> | undefined {
+  const matches = (e: { nodeId: string; instanceId?: string }): boolean => (e.instanceId ?? e.nodeId) === key;
   let pending: Extract<StoredEvent, { type: 'nodeRetryRequested' }> | undefined;
   for (const e of events) {
-    if (e.type === 'nodeRetryRequested' && e.nodeId === nodeId) pending = e;
-    else if (e.type === 'nodeDispatched' && e.nodeId === nodeId && e.attemptId === pending?.nextAttemptId) {
+    if (e.type === 'nodeRetryRequested' && matches(e)) pending = e;
+    else if (e.type === 'nodeDispatched' && matches(e) && e.attemptId === pending?.nextAttemptId) {
       pending = undefined;
     }
   }
@@ -476,6 +640,9 @@ export interface V3GateRecovery {
   /** exhausted loop whose grant card the daemon should (re)post — the loop
    *  flavor of the same crash window. */
   repostLoopGrant?: V3LoopExhaustedInfo;
+  /** revisit-budget-exhausted node whose grant card the daemon should (re)post —
+   *  the revisit flavor of the same crash window. */
+  repostRevisitGrant?: V3RevisitBudgetBlockedInfo;
   /** true when a resolved-but-unjournaled gate was healed → daemon should driveV3Run. */
   resume: boolean;
 }
@@ -489,6 +656,8 @@ export interface V3GateRunnerDeps {
   postBlockedCard?: (binding: RunChatBinding, info: V3BlockedInfo, runId: string) => Promise<void>;
   /** Post (or re-post) an exhausted loop's grant card. */
   postLoopGrantCard?: (binding: RunChatBinding, info: V3LoopExhaustedInfo, runId: string) => Promise<void>;
+  /** Post (or re-post) a revisit-budget-exhausted node's grant card. */
+  postRevisitGrantCard?: (binding: RunChatBinding, info: V3RevisitBudgetBlockedInfo, runId: string) => Promise<void>;
   /** Notify a terminal run (optional, daemon-supplied). */
   notifyTerminal?: (binding: RunChatBinding | undefined, runId: string, outcome: V3TerminalOutcome) => Promise<void>;
   /** runtime deps passthrough (tests inject; daemon uses real pool). */
@@ -533,6 +702,7 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
           postGateCard: (binding, gate, rid) => deps.postCard(binding, gate, rid),
           postBlockedCard: deps.postBlockedCard,
           postLoopGrantCard: deps.postLoopGrantCard,
+          postRevisitGrantCard: deps.postRevisitGrantCard,
           onTerminal: (rid, outcome, binding) =>
             deps.notifyTerminal ? deps.notifyTerminal(binding, rid, outcome) : Promise.resolve(),
         });
@@ -577,6 +747,13 @@ export function createV3GateRunner(deps: V3GateRunnerDeps) {
         if (rec.repostLoopGrant && deps.postLoopGrantCard) {
           try {
             await deps.postLoopGrantCard(rec.binding, rec.repostLoopGrant, rec.runId);
+          } catch (err) {
+            deps.onError?.(rec.runId, err);
+          }
+        }
+        if (rec.repostRevisitGrant && deps.postRevisitGrantCard) {
+          try {
+            await deps.postRevisitGrantCard(rec.binding, rec.repostRevisitGrant, rec.runId);
           } catch (err) {
             deps.onError?.(rec.runId, err);
           }
@@ -636,12 +813,18 @@ export function reconcileV3PendingGates(baseDir: string = defaultBaseDir(), owne
           }
           out.push({ runId, runDir, binding, repost: [], repostLoopGrant: info, resume: false });
         } else {
-          out.push({
-            runId, runDir, binding,
-            repost: [],
-            repostBlocked: blockedInfoFor(events, snap.blockedNodeId),
-            resume: false,
-          });
+          // Revisit-budget block → grant card; otherwise the plain retry card.
+          const revisitBudget = revisitBudgetBlockedInfoFor(events, snap.blockedNodeId);
+          if (revisitBudget) {
+            out.push({ runId, runDir, binding, repost: [], repostRevisitGrant: revisitBudget, resume: false });
+          } else {
+            out.push({
+              runId, runDir, binding,
+              repost: [],
+              repostBlocked: blockedInfoFor(events, snap.blockedNodeId),
+              resume: false,
+            });
+          }
         }
         continue;
       }
@@ -720,11 +903,14 @@ function reconcileOneRun(
   const repost: V3PendingGate[] = [];
   let resume = false;
   for (const nodeId of gateWaitingNodes) {
-    const waitId = `${nodeId}-gate`;
+    // Instance-level waitId mirrors startGate so recovery reads the SAME wait
+    // file the dispatch wrote (stale-card protection).
+    const instanceId = snap.nodes.get(nodeId)?.effectiveInstanceId;
+    const waitId = `${instanceId ?? nodeId}-gate`;
     let wait = readWait(runDir, waitId);
     if (!wait) {
       const gate = dagNodeGate.get(nodeId) ?? normalizeGateWaitInput({ prompt: '(humanGate — 等待人工审批)' });
-      wait = writePendingWait(runDir, { waitId, nodeId, ...gate });
+      wait = writePendingWait(runDir, { waitId, nodeId, ...(instanceId ? { instanceId } : {}), ...gate });
     }
     if (wait.status === 'pending') {
       repost.push({
@@ -741,6 +927,7 @@ function reconcileOneRun(
       appendEvent(journalPath, {
         type: 'gateResolved',
         nodeId: wait.nodeId,
+        ...(snap.nodes.get(wait.nodeId)?.effectiveInstanceId ? { instanceId: snap.nodes.get(wait.nodeId)!.effectiveInstanceId } : {}),
         waitId,
         resolution: wait.status,
         by: wait.by ?? 'system',

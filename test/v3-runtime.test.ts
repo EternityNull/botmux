@@ -9,14 +9,15 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
 
 import { validateDag } from '../src/workflows/v3/dag.js';
 import { appendEvent, readJournal } from '../src/workflows/v3/journal.js';
-import { runWorkflow, type V3RuntimeDeps } from '../src/workflows/v3/runtime.js';
+import { runWorkflow, revisitBudgetStatus, type V3RuntimeDeps } from '../src/workflows/v3/runtime.js';
+import { requestRevisitGrant } from '../src/workflows/v3/daemon-run.js';
 import { readAndValidateManifest, ManifestValidationError } from '../src/workflows/v3/manifest.js';
 import {
   createFileGate,
@@ -124,16 +125,16 @@ describe('runWorkflow — research→summarize 最小闭环', () => {
       expect(events.some((e) => e.type === 'runSucceeded')).toBe(true);
 
       const inputs = JSON.parse(
-        readFileSync(join(outcome.runDir, 'summarize', 'attempts', '001', 'inputs.json'), 'utf-8'),
+        readFileSync(join(outcome.runDir, 'summarize#001', 'attempts', '001', 'inputs.json'), 'utf-8'),
       ) as GoalInputs;
       expect(inputs.inputs).toHaveLength(1);
       expect(isAbsolute(inputs.inputs[0]!.path)).toBe(true);
-      expect(inputs.inputs[0]!.path).toContain(join('research', 'attempts', '001', 'work', 'out.md'));
+      expect(inputs.inputs[0]!.path).toContain(join('research#001', 'attempts', '001', 'work', 'out.md'));
 
       // goal.txt carries the user goal + the full execution/manifest contract
       // (it is NOT the bare goal string) so the short `/goal` command can just
       // point the agent here without tripping TUI paste-detection.
-      const goalFile = readFileSync(join(outcome.runDir, 'research', 'attempts', '001', 'goal.txt'), 'utf-8');
+      const goalFile = readFileSync(join(outcome.runDir, 'research#001', 'attempts', '001', 'goal.txt'), 'utf-8');
       expect(goalFile).toContain('调研 X');                         // the user goal
       expect(goalFile).toContain(GOAL_ENV.MANIFEST_PATH);           // contract references the manifest env
       expect(goalFile).toContain('"schemaVersion": 1');             // rendered manifest shape
@@ -271,15 +272,15 @@ describe('runWorkflow — edge activation', () => {
         from: e.from, to: e.to, active: e.active, sourceAttemptId: e.sourceAttemptId,
       })).sort((a, b) => a.to.localeCompare(b.to));
       expect(resolved).toEqual([
-        { from: 'judge', to: 'fail', active: false, sourceAttemptId: 'judge/attempts/001' },
-        { from: 'judge', to: 'pass', active: true, sourceAttemptId: 'judge/attempts/001' },
+        { from: 'judge', to: 'fail', active: false, sourceAttemptId: 'judge#001/attempts/001' },
+        { from: 'judge', to: 'pass', active: true, sourceAttemptId: 'judge#001/attempts/001' },
       ]);
       expect(events.some((e) => e.type === 'nodeSkipped' && e.nodeId === 'fail')).toBe(true);
       expect(events.some((e) => e.type === 'nodeDispatched' && e.nodeId === 'fail')).toBe(false);
       expect(events.some((e) => e.type === 'nodeSucceeded' && e.nodeId === 'merge')).toBe(true);
       expect(mergeInputs?.inputs.map((i) => i.from)).toEqual(['pass']);
       expect(mergeInputs?.omitted).toEqual([{ from: 'fail', reason: 'sourceSkipped' }]);
-      const mergeGoal = readFileSync(join(outcome.runDir, 'merge', 'attempts', '001', 'goal.txt'), 'utf-8');
+      const mergeGoal = readFileSync(join(outcome.runDir, 'merge#001', 'attempts', '001', 'goal.txt'), 'utf-8');
       expect(mergeGoal).toContain('omitted');
     } finally {
       rmSync(base, { recursive: true, force: true });
@@ -414,7 +415,7 @@ describe('runWorkflow — humanGate suspend mode', () => {
         runDir: join(base, 'gate-run'),
         pendingWaits: [{
           nodeId: 'deploy',
-          waitId: 'deploy-gate',
+          waitId: 'deploy#001-gate',
           prompt: '批准部署？',
           options: ['approve', 'reject'],
           approveOptions: ['approve'],
@@ -422,7 +423,7 @@ describe('runWorkflow — humanGate suspend mode', () => {
         }],
       });
       expect(runNodeCalls).toBe(0);
-      expect(readWait(first.runDir, 'deploy-gate')).toMatchObject({
+      expect(readWait(first.runDir, 'deploy#001-gate')).toMatchObject({
         status: 'pending',
         nodeId: 'deploy',
         prompt: '批准部署？',
@@ -431,11 +432,11 @@ describe('runWorkflow — humanGate suspend mode', () => {
       expect(events.some((e) => e.type === 'gateDispatched' && e.nodeId === 'deploy')).toBe(true);
       expect(events.some((e) => e.type === 'nodeDispatched' && e.nodeId === 'deploy')).toBe(false);
 
-      resolveWait(first.runDir, 'deploy-gate', 'approved', 'ou_reviewer');
+      resolveWait(first.runDir, 'deploy#001-gate', 'approved', 'ou_reviewer');
       appendEvent(join(first.runDir, 'journal.ndjson'), {
         type: 'gateResolved',
         nodeId: 'deploy',
-        waitId: 'deploy-gate',
+        waitId: 'deploy#001-gate',
         resolution: 'approved',
         by: 'ou_reviewer',
       });
@@ -483,7 +484,7 @@ describe('runWorkflow — humanGate suspend mode', () => {
       if (outcome.reason !== 'awaitingGate') throw new Error('expected awaitingGate outcome');
       expect(outcome.pendingWaits).toEqual([{
         nodeId: 'approval',
-        waitId: 'approval-gate',
+        waitId: 'approval#001-gate',
         prompt: '批准？',
         options: ['approve', 'reject'],
         approveOptions: ['approve'],
@@ -491,7 +492,7 @@ describe('runWorkflow — humanGate suspend mode', () => {
       }]);
       const events = readJournal(join(outcome.runDir, 'journal.ndjson'));
       expect(events.some((e) => e.type === 'nodeSucceeded' && e.nodeId === 'research')).toBe(true);
-      expect(readWait(outcome.runDir, 'approval-gate')?.status).toBe('pending');
+      expect(readWait(outcome.runDir, 'approval#001-gate')?.status).toBe('pending');
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
@@ -526,7 +527,7 @@ describe('runWorkflow — humanGate suspend mode', () => {
       const outcome = await runWorkflow(dag, deps, { baseDir: base });
 
       expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
-      expect(readWait(outcome.runDir, 'deploy-gate')).toMatchObject({ status: 'approved', by: 'ou_cli' });
+      expect(readWait(outcome.runDir, 'deploy#001-gate')).toMatchObject({ status: 'approved', by: 'ou_cli' });
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
@@ -633,6 +634,269 @@ describe('runtime CLI 白名单守卫', () => {
       const dag = validateDag({ runId: 'seed-run', nodes: [{ id: 'n', type: 'goal', goal: 'g', depends: [], inputs: [] }] });
       const outcome = await runWorkflow(dag, deps, { baseDir: base });
       expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── 跨节点回溯 A→B→C 端到端（菲菲的精确验收）────────────────────────────────
+describe('runWorkflow — 跨节点 revisit A→B→C', () => {
+  it('C#001 回溯 A → A/B/C#001 全 superseded → 重生 #002 → 仅 C#002 done run 才成功; B#002 读 A#002', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-revisit-'));
+    try {
+      const dag = validateDag({
+        runId: 'revisit-abc',
+        nodes: [
+          { id: 'A', type: 'goal', goal: 'a', depends: [], inputs: [] },
+          { id: 'B', type: 'goal', goal: 'b', depends: ['A'], inputs: [{ from: 'A' }] },
+          // C 声明可回溯到祖先 A
+          { id: 'C', type: 'goal', goal: 'c', depends: ['B'], inputs: [{ from: 'B' }], revisitTo: ['A'] },
+        ],
+      });
+      let cRuns = 0;
+      let bSawAContent = '';
+      let aRevisitFeedback: GoalInputs['inputs'] = [];
+      const runNode: RunNode = async (req) => {
+        if (req.node.id === 'A') {
+          // A#002 是回溯目标的重跑：捕获注入的 from:revisit 反馈。
+          if (req.attemptId.startsWith('A#002')) {
+            const inputs = JSON.parse(readFileSync(req.inputsPath, 'utf-8')) as GoalInputs;
+            aRevisitFeedback = inputs.inputs.filter((i) => i.from === 'revisit');
+          }
+          // 第二次跑(A#002)产出不同内容,用来验证 B#002 读到的是新版
+          const content = req.attemptId.startsWith('A#002') ? 'A-v2' : 'A-v1';
+          return { status: 'ok', manifestPath: writeManifest(req, {
+            schemaVersion: 1, status: 'ok', summary: 'a', files: [product(req.outputDir, 'a.md', content)],
+          }) };
+        }
+        if (req.node.id === 'B') {
+          const inputs = JSON.parse(readFileSync(req.inputsPath, 'utf-8')) as GoalInputs;
+          const fromA = inputs.inputs.find((i) => i.from === 'A');
+          if (fromA && req.attemptId.startsWith('B#002')) bSawAContent = readFileSync(fromA.path, 'utf-8');
+          return { status: 'ok', manifestPath: writeManifest(req, {
+            schemaVersion: 1, status: 'ok', summary: 'b', files: [product(req.outputDir, 'b.md', 'B-out')],
+          }) };
+        }
+        // C: 首个 instance(C#001)写 result.json 请求回溯到 A；第二个(C#002)正常成功。
+        cRuns++;
+        if (req.attemptId.startsWith('C#001')) {
+          const rj = jsonProduct(req.outputDir, 'result.json', { status: 'revisit', revisitTo: 'A', reason: '缺计费规则' });
+          return { status: 'ok', manifestPath: writeManifest(req, {
+            schemaVersion: 1, status: 'ok', summary: 'revisit', files: [rj],
+          }) };
+        }
+        return { status: 'ok', manifestPath: writeManifest(req, {
+          schemaVersion: 1, status: 'ok', summary: 'c done', files: [product(req.outputDir, 'c.md', 'C-out')],
+        }) };
+      };
+
+      const deps: V3RuntimeDeps = { runNode, validateManifest, resolveBotSnapshot };
+      const outcome = await runWorkflow(dag, deps, { baseDir: base });
+
+      expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
+      const events = readJournal(join(outcome.runDir, 'journal.ndjson'));
+
+      // C 请求了回溯到 A
+      const rr = events.find((e) => e.type === 'nodeRevisitRequested' && (e as any).toNodeId === 'A') as any;
+      expect(rr).toBeDefined();
+      // 协议:journal 里三个 feedback 路径都是 runDir 相对(可搬迁 + 不泄漏本机绝对路径)
+      expect(isAbsolute(rr.reasonPath)).toBe(false);
+      expect(isAbsolute(rr.sourceManifestPath)).toBe(false);
+      expect(isAbsolute(rr.targetPreviousManifestPath)).toBe(false);
+      // A/B/C 的 #001 实例全部被 supersede（刷新）
+      expect(events.filter((e) => e.type === 'nodeInstanceSuperseded').map((e) => (e as any).instanceId).sort())
+        .toEqual(['A#001', 'B#001', 'C#001']);
+      // 重新生成 #002 三个实例
+      expect(events.filter((e) => e.type === 'nodeDispatched' && (e as any).instanceId?.endsWith('#002'))
+        .map((e) => (e as any).instanceId).sort()).toEqual(['A#002', 'B#002', 'C#002']);
+      // 只有 C#002 成功（C#001 是 revisit,不算成功终态）
+      expect(events.some((e) => e.type === 'nodeSucceeded' && (e as any).instanceId === 'C#002')).toBe(true);
+      expect(events.some((e) => e.type === 'nodeSucceeded' && (e as any).instanceId === 'C#001')).toBe(false);
+      // B#002 的 inputs 来自 A#002（新版产物），不是 A#001
+      expect(bSawAContent).toBe('A-v2');
+      // A#002(回溯目标重跑)拿到三件套 feedback:reason + 下游(C)产出 + A 自己旧产出。
+      expect(aRevisitFeedback.some((i) => i.name === 'reason' && (i.preview ?? '').includes('缺计费规则'))).toBe(true);
+      expect(aRevisitFeedback.some((i) => i.name.startsWith('source:'))).toBe(true); // C 的 result.json
+      // previous: A#001 的旧产物 a.md(内容 'A-v1')
+      const prev = aRevisitFeedback.find((i) => i.name.startsWith('previous:'));
+      expect(prev).toBeDefined();
+      expect(readFileSync(prev!.path, 'utf-8')).toBe('A-v1');
+      // C 一共跑了 2 次（#001 回溯 + #002 成功）
+      expect(cRuns).toBe(2);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('buildInputs 抗旧实例迟到成功：journal 里 A 最后一条 success 是迟到的 A#001,B 仍读 A#002', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-latestale-'));
+    try {
+      const dag = validateDag({
+        runId: 'late',
+        nodes: [
+          { id: 'A', type: 'goal', goal: 'a', depends: [], inputs: [] },
+          { id: 'B', type: 'goal', goal: 'b', depends: ['A'], inputs: [{ from: 'A' }] },
+        ],
+      });
+      const runDir = join(base, 'late');
+      const writeA = (inst: string, content: string): string => {
+        const work = join(runDir, inst, 'attempts', '001', 'work');
+        mkdirSync(work, { recursive: true });
+        const file = product(work, 'a.md', content);
+        const mp = join(runDir, inst, 'attempts', '001', 'manifest.json');
+        writeFileSync(mp, JSON.stringify({ schemaVersion: 1, status: 'ok', summary: 'a', files: [file] }));
+        return mp;
+      };
+      const m1 = writeA('A#001', 'A-v1');
+      const m2 = writeA('A#002', 'A-v2');
+      const jp = join(runDir, 'journal.ndjson');
+      appendEvent(jp, { type: 'runStarted', runId: 'late' });
+      appendEvent(jp, { type: 'nodeDispatched', nodeId: 'A', instanceId: 'A#001', attemptId: 'A#001/attempts/001' });
+      appendEvent(jp, { type: 'nodeSucceeded', nodeId: 'A', instanceId: 'A#001', attemptId: 'A#001/attempts/001', manifestPath: m1 });
+      appendEvent(jp, { type: 'nodeInstanceSuperseded', nodeId: 'A', instanceId: 'A#001', byNodeId: 'A', reason: 'refresh' });
+      appendEvent(jp, { type: 'nodeDispatched', nodeId: 'A', instanceId: 'A#002', attemptId: 'A#002/attempts/001' });
+      appendEvent(jp, { type: 'nodeSucceeded', nodeId: 'A', instanceId: 'A#002', attemptId: 'A#002/attempts/001', manifestPath: m2 });
+      // 旧 A#001 worker 迟到再写一次 success → journal 里 A 的“最后一条” success 是 A#001（nodeId-latest 会被它骗到）
+      appendEvent(jp, { type: 'nodeSucceeded', nodeId: 'A', instanceId: 'A#001', attemptId: 'A#001/attempts/001', manifestPath: m1 });
+
+      let bSawA = '';
+      const runNode: RunNode = async (req) => {
+        if (req.node.id === 'B') {
+          const inputs = JSON.parse(readFileSync(req.inputsPath, 'utf-8')) as GoalInputs;
+          const fromA = inputs.inputs.find((i) => i.from === 'A');
+          bSawA = fromA ? readFileSync(fromA.path, 'utf-8') : '(none)';
+        }
+        return { status: 'ok', manifestPath: writeManifest(req, {
+          schemaVersion: 1, status: 'ok', summary: 'b', files: [product(req.outputDir, 'b.md', 'B-out')],
+        }) };
+      };
+      const deps: V3RuntimeDeps = { runNode, validateManifest, resolveBotSnapshot };
+      const outcome = await runWorkflow(dag, deps, { baseDir: base });
+      expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
+      // 关键:按 effective instance(A#002)取产物,不被迟到的 A#001 success 污染。
+      expect(bSawA).toBe('A-v2');
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('回溯预算:per-pair 默认 1,第二次 C→A 回溯耗尽 → run blocked(防无限回溯)', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-budget-'));
+    try {
+      const dag = validateDag({
+        runId: 'budget-abc',
+        nodes: [
+          { id: 'A', type: 'goal', goal: 'a', depends: [], inputs: [] },
+          { id: 'C', type: 'goal', goal: 'c', depends: ['A'], inputs: [{ from: 'A' }], revisitTo: ['A'] },
+        ],
+      });
+      let cRuns = 0;
+      const runNode: RunNode = async (req) => {
+        if (req.node.id === 'A') {
+          return { status: 'ok', manifestPath: writeManifest(req, {
+            schemaVersion: 1, status: 'ok', summary: 'a', files: [product(req.outputDir, 'a.md', 'A')],
+          }) };
+        }
+        // C 每次都请求回溯到 A（永不满意）。
+        cRuns++;
+        const rj = jsonProduct(req.outputDir, 'result.json', { status: 'revisit', revisitTo: 'A', reason: '还是不行' });
+        return { status: 'ok', manifestPath: writeManifest(req, {
+          schemaVersion: 1, status: 'ok', summary: 'revisit', files: [rj],
+        }) };
+      };
+      const deps: V3RuntimeDeps = { runNode, validateManifest, resolveBotSnapshot };
+      const outcome = await runWorkflow(dag, deps, { baseDir: base });
+
+      // C#001 回溯(允许)→ A#002 + C#002 → C#002 再回溯(pair 1/1 耗尽)→ C#002 blocked → run blocked
+      expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'blocked' });
+      const events = readJournal(join(outcome.runDir, 'journal.ndjson'));
+      expect(events.filter((e) => e.type === 'nodeRevisitRequested').length).toBe(1); // 只放行了 1 次
+      expect(events.some((e) => e.type === 'nodeBlocked' && (e as any).errorCode === 'REVISIT_BUDGET_EXHAUSTED')).toBe(true);
+      expect(cRuns).toBe(2); // C#001(放行) + C#002(被预算挡下)
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('回溯预算:revisitBudgetStatus 计数 + grant 事件解锁(纯函数,不泄漏别的 pair)', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-budgetstatus-'));
+    try {
+      const jp = join(base, 'journal.ndjson');
+      appendEvent(jp, { type: 'runStarted', runId: 'g' });
+      appendEvent(jp, { type: 'nodeRevisitRequested', nodeId: 'C', instanceId: 'C#001', attemptId: 'C#001/attempts/001', toNodeId: 'A' });
+      expect(revisitBudgetStatus(readJournal(jp), 'C', 'A').ok).toBe(false); // pair 1/1 耗尽
+      // pair grant +1（直接 append 事件,测计数,不经 requestRevisitGrant 的恢复语义）
+      appendEvent(jp, { type: 'revisitBudgetGranted', sourceNodeId: 'C', toNodeId: 'A', by: 'ou_user' });
+      expect(revisitBudgetStatus(readJournal(jp), 'C', 'A').ok).toBe(true);  // 1 < 1+1
+      expect(revisitBudgetStatus(readJournal(jp), 'D', 'A').ok).toBe(true);  // pair grant 不泄漏到 D→A
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('回溯预算:requestRevisitGrant 守卫 + 原子 grant+retry 恢复', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-grant-'));
+    try {
+      const runId = 'g';
+      const jp = join(base, runId, 'journal.ndjson');
+      // 造一个"卡在 REVISIT_BUDGET_EXHAUSTED"的 run:C#002 想回溯 A 但预算耗尽。
+      appendEvent(jp, { type: 'runStarted', runId });
+      appendEvent(jp, { type: 'nodeDispatched', nodeId: 'C', instanceId: 'C#002', attemptId: 'C#002/attempts/001' });
+      appendEvent(jp, { type: 'nodeRevisitRequested', nodeId: 'C', instanceId: 'C#001', attemptId: 'C#001/attempts/001', toNodeId: 'A' });
+      appendEvent(jp, {
+        type: 'nodeBlocked', nodeId: 'C', instanceId: 'C#002', attemptId: 'C#002/attempts/001',
+        errorClass: 'resultInvalid', errorCode: 'REVISIT_BUDGET_EXHAUSTED', message: 'exhausted',
+      });
+      appendEvent(jp, { type: 'runBlocked', blockedNodeId: 'C' });
+
+      // 守卫:半个 pair → invalid;pair source 不是 blocked 节点 → invalid。
+      expect(requestRevisitGrant(base, runId, { sourceNodeId: 'C', by: 'u' })).toEqual({ kind: 'invalid', reason: 'partial-pair' });
+      expect(requestRevisitGrant(base, runId, { sourceNodeId: 'X', toNodeId: 'A', by: 'u' })).toEqual({ kind: 'invalid', reason: 'pair-source-mismatch' });
+      // stale attempt → 拒绝
+      expect(requestRevisitGrant(base, runId, { sourceNodeId: 'C', toNodeId: 'A', by: 'u', expectedAttemptId: 'C#002/attempts/999' }))
+        .toEqual({ kind: 'stale-run', reason: 'stale-attempt' });
+
+      // 合法 pair grant → granted + 原子 retry(C 重新派 attempts/002)
+      const out = requestRevisitGrant(base, runId, { sourceNodeId: 'C', toNodeId: 'A', by: 'ou_user', expectedAttemptId: 'C#002/attempts/001' });
+      expect(out.kind).toBe('granted');
+      if (out.kind !== 'granted') throw new Error('expected granted');
+      expect(out.scope).toBe('pair');
+      expect(out.retry).toMatchObject({ kind: 'requested', nodeId: 'C', nextAttemptId: 'C#002/attempts/002' });
+      // 预算确实加了
+      const events = readJournal(jp);
+      expect(events.filter((e) => e.type === 'revisitBudgetGranted').length).toBe(1);
+      // 幂等/新鲜度:retry 后 C 已 pending,再点 grant → not-budget-blocked,不再加预算
+      expect(requestRevisitGrant(base, runId, { sourceNodeId: 'C', toNodeId: 'A', by: 'ou_user' }))
+        .toEqual({ kind: 'stale-run', reason: 'not-budget-blocked' });
+      expect(readJournal(jp).filter((e) => e.type === 'revisitBudgetGranted').length).toBe(1); // 没多加
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('回溯预算:grant 已写但 retry 未写的崩溃窗口 → 不重复加预算,只补 retry(recovery-safe)', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-grant-crash-'));
+    try {
+      const runId = 'g';
+      const jp = join(base, runId, 'journal.ndjson');
+      appendEvent(jp, { type: 'runStarted', runId });
+      appendEvent(jp, { type: 'nodeDispatched', nodeId: 'C', instanceId: 'C#002', attemptId: 'C#002/attempts/001' });
+      appendEvent(jp, { type: 'nodeRevisitRequested', nodeId: 'C', instanceId: 'C#001', attemptId: 'C#001/attempts/001', toNodeId: 'A' });
+      appendEvent(jp, {
+        type: 'nodeBlocked', nodeId: 'C', instanceId: 'C#002', attemptId: 'C#002/attempts/001',
+        errorClass: 'resultInvalid', errorCode: 'REVISIT_BUDGET_EXHAUSTED', message: 'exhausted', revisitTo: 'A',
+      });
+      appendEvent(jp, { type: 'runBlocked', blockedNodeId: 'C' });
+      // 崩溃窗口:grant 已写(预算已 ok),但 retry 还没写 —— 节点仍 blocked。
+      appendEvent(jp, { type: 'revisitBudgetGranted', sourceNodeId: 'C', toNodeId: 'A', by: 'ou_user' });
+
+      // 恢复点击:绝不能再 append 第二条 grant(否则一次准许变 +2),只补 retry。
+      const out = requestRevisitGrant(base, runId, { sourceNodeId: 'C', toNodeId: 'A', by: 'ou_user', expectedAttemptId: 'C#002/attempts/001' });
+      expect(out.kind).toBe('granted');
+      const events = readJournal(jp);
+      expect(events.filter((e) => e.type === 'revisitBudgetGranted').length).toBe(1); // 仍是 1,没翻倍
+      expect(events.find((e) => e.type === 'nodeRetryRequested')).toMatchObject({ nodeId: 'C', nextAttemptId: 'C#002/attempts/002' });
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

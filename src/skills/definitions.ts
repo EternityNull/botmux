@@ -973,17 +973,18 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 
 const GOAL_ASK_SKILL = `---
 name: botmux-goal-ask
-description: v3 goal-mode 节点在真正需要人类判断时使用的文件式 ask 协议。触发场景：你运行在 botmux v3 goal-mode，必须让人从 2-6 个明确选项中做一个判断，且无法自行研究或推断。不要调用原生 AskUserQuestion，也不要调用 botmux ask；写 ask.json + ASK_HUMAN failure manifest 后停止。
+description: v3 goal-mode 节点在真正需要人类判断时使用的文件式 ask 协议。触发场景：你运行在 botmux v3 goal-mode，必须让人做选择或补充自由文本，且无法自行研究或推断。不要调用原生 AskUserQuestion，也不要调用 botmux ask；写 ask.json + ASK_HUMAN failure manifest 后停止。
 ---
 
 # botmux-goal-ask — v3 goal-mode 人类判断
 
-你运行在 botmux v3 goal-mode 时，不能打开原生交互问答，也不能调用 \`botmux ask\`。如果且仅如果你遇到**必须由人做判断**的选择题，使用本文件协议暂停节点。
+你运行在 botmux v3 goal-mode 时，不能打开原生交互问答，也不能调用 \`botmux ask\`。如果且仅如果你遇到**必须由人做判断或补充信息**的问题，使用本文件协议暂停节点。
 
 ## 什么时候用
 
 - 需要产品 / 业务 / 风险决策，不能通过读取文件、运行命令、搜索资料自行判断
 - 选项已经清楚，可以给出 2-6 个具体选择
+- 需要人补充一段规则、细节、边界说明，不能改写成有限选项
 - 没有人回答前继续执行会改变方向或造成风险
 
 ## 什么时候不要用
@@ -991,16 +992,27 @@ description: v3 goal-mode 节点在真正需要人类判断时使用的文件式
 - 登录、鉴权、权限、外部确认弹窗：写普通 retryable failure manifest（如 \`AUTH_REQUIRED\`），不要 ask
 - 你可以自行推断、测试或查证的问题：直接处理，不要打断人
 - workflow 节点审批：外层 humanGate 已经处理，不要套 ask
-- 自由文本长回答：v3 MVP 只支持选项按钮；把问题改写成清晰选项
+- 可以通过有限选项表达的问题：优先用 options，不要滥用自由文本
 
 ## 协议
 
-1. 写 ask 文件到当前 attempt 目录：
+1. 写 ask 文件到当前 attempt 目录。
+
+选择题：
 
 \`\`\`json
 {
   "question": "一个清晰的问题",
   "options": ["选项 A", "选项 B"]
+}
+\`\`\`
+
+填空题：
+
+\`\`\`json
+{
+  "question": "请补充计费规则的边界说明",
+  "freeText": true
 }
 \`\`\`
 
@@ -1046,7 +1058,7 @@ $${GOAL_ENV.INPUTS_PATH}
 { "from": "human", "name": "answer", "path": "/absolute/path/to/answer.json", "kind": "json" }
 \`\`\`
 
-读取它的 \`path\`，里面的 \`selected\` 就是人类选项，然后继续完成原目标。
+读取它的 \`path\`：选择题看 \`selected\`，填空题看 \`text\`，然后继续完成原目标。
 `;
 
 const WORKER_BUDGET_SKILL = `---

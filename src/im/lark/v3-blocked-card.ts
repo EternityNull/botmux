@@ -13,6 +13,7 @@ import { config } from '../../config.js';
 export const V3_BLOCKED_RETRY_ACTION = 'v3_blocked_retry';
 /** 运行时 human-ask 选项按钮的 action（与「重试」同卡不同 namespace）。 */
 export const V3_BLOCKED_ASK_ANSWER_ACTION = 'v3_blocked_ask_answer';
+export const V3_BLOCKED_ASK_TEXT_FIELD = 'v3_blocked_ask_text';
 
 /** card 按钮回传的 value 形态——v3-blocked-card-handler 据此解析。 */
 export interface V3BlockedActionValue {
@@ -24,16 +25,26 @@ export interface V3BlockedActionValue {
   nonce: string;
 }
 
-/** ask 选项按钮回传的 value —— 人选的选项 + 受阻 attempt（freshness）。 */
-export interface V3AskAnswerActionValue {
-  action: typeof V3_BLOCKED_ASK_ANSWER_ACTION;
-  runId: string;
-  nodeId: string;
-  attemptId: string;
-  /** 选中的选项文本（= GoalAsk.options 之一），落库为 answer.selected。 */
-  selected: string;
-  nonce: string;
-}
+/** ask 回传的 value —— 人的答案 + 受阻 attempt（freshness）。 */
+export type V3AskAnswerActionValue =
+  | {
+      action: typeof V3_BLOCKED_ASK_ANSWER_ACTION;
+      runId: string;
+      nodeId: string;
+      attemptId: string;
+      /** 选中的选项文本（= GoalAsk.options 之一），落库为 answer.selected。 */
+      selected: string;
+      nonce: string;
+    }
+  | {
+      action: typeof V3_BLOCKED_ASK_ANSWER_ACTION;
+      runId: string;
+      nodeId: string;
+      attemptId: string;
+      /** 自由文本答案走 form_value[V3_BLOCKED_ASK_TEXT_FIELD]，不塞进 button value。 */
+      answerKind: 'text';
+      nonce: string;
+    };
 
 export interface V3BlockedCardInput {
   runId: string;
@@ -48,10 +59,10 @@ export interface V3BlockedCardInput {
   messageMaxChars?: number;
   /** 有值 → 渲染冻结的「已重试」卡（无按钮，防 stale UI 重复提交）。 */
   retried?: { nextAttemptId: string; by?: string };
-  /** 运行时 human-ask：agent 的问题 + 选项 → 渲染选项按钮卡（替代重试按钮）。 */
-  ask?: { question: string; options: string[] };
+  /** 运行时 human-ask：agent 的问题 → 渲染选项按钮或自由文本输入卡。 */
+  ask?: { question: string; options?: string[]; freeText?: boolean };
   /** 有值 → 渲染冻结的「已回答」卡（ask 专用，无按钮）。 */
-  answered?: { selected: string; nextAttemptId: string; by?: string };
+  answered?: { selected?: string; text?: string; nextAttemptId: string; by?: string };
 }
 
 const DEFAULT_MESSAGE_MAX_CHARS = 500;
@@ -102,22 +113,50 @@ export function buildV3BlockedCard(input: V3BlockedCardInput): string {
       });
     }
     if (answered) {
+      const answerPreview = answered.text ?? answered.selected ?? '';
       elements.push({ tag: 'hr' });
       elements.push({
         tag: 'div',
         text: {
           tag: 'lark_md',
           content:
-            `✅ 已选择 → **${escapeMd(answered.selected)}**` +
+            `✅ 已回答 → **${escapeMd(truncate(answerPreview, msgMax))}**` +
             (answered.by ? ` · by ${escapeMd(short(answered.by, 20))}` : '') +
             ` · 重跑 ${escapeMd(answered.nextAttemptId.slice(answered.nextAttemptId.lastIndexOf('/') + 1))}`,
         },
+      });
+    } else if (ask?.freeText) {
+      elements.push({
+        tag: 'form',
+        name: 'v3_blocked_ask_text_form',
+        elements: [
+          {
+            tag: 'input',
+            name: V3_BLOCKED_ASK_TEXT_FIELD,
+            placeholder: { tag: 'plain_text', content: '填写答案' },
+          },
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: '提交并重跑' },
+            type: 'primary',
+            name: 'v3_blocked_ask_text_submit',
+            action_type: 'form_submit',
+            value: {
+              action: V3_BLOCKED_ASK_ANSWER_ACTION,
+              runId: input.runId,
+              nodeId: input.nodeId,
+              attemptId: input.attemptId,
+              answerKind: 'text',
+              nonce,
+            } satisfies V3AskAnswerActionValue,
+          },
+        ],
       });
     } else if (ask) {
       // 一个选项一个按钮，选中文本回传为 answer.selected（按 attempt 入 nonce 防 stale）。
       elements.push({
         tag: 'action',
-        actions: ask.options.map((opt) => ({
+        actions: (ask.options ?? []).map((opt) => ({
           tag: 'button',
           text: { tag: 'plain_text', content: short(opt, 80) },
           type: 'primary',

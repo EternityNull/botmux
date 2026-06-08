@@ -470,3 +470,57 @@ describe('renderGoalFile: enum 说明行', () => {
     expect(noEnum).not.toContain('MUST use one of the listed values');
   });
 });
+
+// ─── revisitTo 校验（跨节点回溯，只能指向祖先）────────────────────────────────
+
+describe('validateDag: revisitTo 校验', () => {
+  // A -> B -> C 链；C 想回溯到祖先 A。
+  const chain = (cExtra: Record<string, unknown>) =>
+    dag([
+      goal('A'),
+      goal('B', { depends: ['A'] }),
+      goal('C', { depends: ['B'], ...cExtra }),
+    ]);
+
+  it('指向(传递)祖先 → 合法', () => {
+    const d = validateDag(chain({ revisitTo: ['A'] }));
+    expect(d.nodes.find((n) => n.id === 'C')?.revisitTo).toEqual(['A']);
+  });
+
+  it('指向直接父节点 → 合法', () => {
+    expect(problemsOf(() => validateDag(chain({ revisitTo: ['B'] })))).toEqual([]);
+  });
+
+  it('未声明 revisitTo → 字段缺省、零问题', () => {
+    const d = validateDag(chain({}));
+    expect(d.nodes.find((n) => n.id === 'C')?.revisitTo).toBeUndefined();
+  });
+
+  it('指向未知节点 → 报 unknown', () => {
+    const p = problemsOf(() => validateDag(chain({ revisitTo: ['X'] })));
+    expect(p.some((m) => m.includes('revisitTo references unknown node "X"'))).toBe(true);
+  });
+
+  it('指向自身 → 拒', () => {
+    const p = problemsOf(() => validateDag(chain({ revisitTo: ['C'] })));
+    expect(p.some((m) => m.includes('cannot point at itself'))).toBe(true);
+  });
+
+  it('指向非祖先(下游/兄弟) → 拒(只能向后跳)', () => {
+    // A 想 revisitTo B,但 B 是 A 的下游 → 非法。
+    const p = problemsOf(() =>
+      validateDag(dag([goal('A', { revisitTo: ['B'] }), goal('B', { depends: ['A'] })])),
+    );
+    expect(p.some((m) => m.includes('must be an ancestor'))).toBe(true);
+  });
+
+  it('revisitTo 不是数组 → 拒', () => {
+    const p = problemsOf(() => validateDag(chain({ revisitTo: 'A' })));
+    expect(p.some((m) => m.includes('must be an array'))).toBe(true);
+  });
+
+  it('revisitTo 有重复 → 报 duplicates', () => {
+    const p = problemsOf(() => validateDag(chain({ revisitTo: ['A', 'A'] })));
+    expect(p.some((m) => m.includes('has duplicates'))).toBe(true);
+  });
+});

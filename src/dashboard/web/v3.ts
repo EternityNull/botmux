@@ -30,6 +30,7 @@ const NODE_LABEL: Record<RunNodeView['status'], string> = {
   skipped: '已跳过', // edge-activation: 分支未选中的中性终态（非失败）
   cancelled: '已取消', // early-release loser：已无关并被收尸的中性终态
   blocked: '受阻',
+  superseded: '已刷新', // 跨节点回溯把该 instance 刷新了，节点会重跑出新 instance
   failed: '失败',
 };
 const DECISION_LABEL: Record<string, string> = {
