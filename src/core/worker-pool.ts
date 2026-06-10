@@ -194,11 +194,26 @@ function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
   return knownBotOpenIdsFromCrossRef(crossRef, botEntries, larkAppId);
 }
 
-function daemonCardFooterRecipientOpenId(ds: DaemonSession): string | undefined {
+function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: string): string | undefined {
   const owner = ds.session.ownerOpenId;
-  if (!owner) return undefined;
+  if (!owner) {
+    // Mira runs through botmux's API runner and cannot execute `botmux send`
+    // itself. For bot-to-bot handoffs, address the daemon fallback card back
+    // to the original dispatcher so orchestration resumes.
+    if (effectiveCliId === 'mira' && ds.session.quoteTargetSenderIsBot && ds.session.creatorOpenId) {
+      return ds.session.creatorOpenId;
+    }
+    return undefined;
+  }
   try {
-    return loadKnownBotOpenIdsForApp(ds.larkAppId).has(owner) ? undefined : owner;
+    if (loadKnownBotOpenIdsForApp(ds.larkAppId).has(owner)) {
+      // `/repo`-primed dispatch records the dispatching bot as owner (unlike
+      // the @-mention auto-create path, which nulls ownerOpenId for bot
+      // senders). Same Mira constraint applies: the daemon fallback is Mira's
+      // only reply channel, so address the dispatcher bot here too.
+      return effectiveCliId === 'mira' ? owner : undefined;
+    }
+    return owner;
   } catch {
     return owner;
   }
@@ -1994,7 +2009,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           break;
         }
         if (!msg.userText.trim() && !msg.assistantText.trim()) break;
-        const recipientOpenId = daemonCardFooterRecipientOpenId(ds);
+        const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
         const cardJson = buildContextualReplyCard({
           title: tr('card.adopt_last_round', undefined, localeForBot(ds.larkAppId)),
           userText: msg.userText,
@@ -2083,7 +2098,7 @@ function deliverFinalOutput(
       // they use the contextual card so the user prompt sits in a
       // blockquote and only the assistant body goes through full markdown
       // rendering.
-      const recipientOpenId = daemonCardFooterRecipientOpenId(ds);
+      const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: msg.kind === 'local-turn-headless'
