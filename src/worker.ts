@@ -15,7 +15,7 @@
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync, readlinkSync, readFileSync, watch as fsWatch, createWriteStream, type FSWatcher, type WriteStream } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
-import { drainTranscript, joinAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { shouldWriteNow } from './utils/input-gate.js';
@@ -1397,7 +1397,13 @@ function emitReadyTurns(): void {
     }
     const set = new Set(turn.assistantUuids);
     const matched = drained.events.filter(e => e.uuid && set.has(e.uuid));
-    const assistantText = joinAssistantText(matched);
+    // Non-adopt fallback posts the turn's FINAL answer (text after the last
+    // tool_use), not the whole-turn narration collage — joining every interim
+    // block both reads as noise in Lark and inflates finalText past the
+    // material-longer gate, re-posting turns the model already `botmux send`ed.
+    // Adopt keeps the full join: transcript drain is that mode's only channel,
+    // so interim narration is the user's only window into the turn.
+    const assistantText = adoptMode ? joinAssistantText(matched) : trailingAssistantText(drained.events, turn.assistantUuids);
     if (assistantText.length === 0) continue;
     const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
 
