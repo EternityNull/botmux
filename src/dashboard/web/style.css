@@ -1642,6 +1642,28 @@ button.primary {
   white-space: nowrap;
 }
 
+/* 终端弹窗标题旁的铅笔：常显小尺寸，与 card-act 一致 */
+.term-modal-title .card-act {
+  width: 26px;
+  height: 26px;
+  min-height: 26px;
+  flex: none;
+}
+
+/* 标题就地编辑输入框 */
+.term-modal-name-input {
+  min-width: 180px;
+  max-width: 380px;
+  margin: 0;
+  padding: 3px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .term-modal-actions {
   flex: none;
   display: inline-flex;
