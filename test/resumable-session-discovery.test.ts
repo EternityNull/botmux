@@ -174,6 +174,44 @@ describe('discoverRolloutSessions (codex / traex)', () => {
     expect(out.map((s) => s.cliSessionId)).toEqual(['sid-ext']);
   });
 
+  it('drops botmux-origin rollouts with stable metadata before user_message', async () => {
+    writeRollout('2026/06/14', 'rollout-bmx-prefix.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-bmx-prefix', cwd: '/root/x' } },
+      {
+        type: 'event_msg',
+        payload: {
+          type: 'user_message',
+          message: '<botmux_routing>\nuse botmux send\n</botmux_routing>\n\n<identity>\n  <name>Codex Bot</name>\n  <open_id>ou_bot</open_id>\n</identity>\n\n<session_id>sess-123</session_id>\n\n<role context="team" chat_id="oc_team">\nreviewer\n</role>\n\n<user_message>\nactual prompt\n</user_message>',
+        },
+      },
+    ]);
+    writeRollout('2026/06/15', 'rollout-ext-prefix-discuss.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-ext-prefix-discuss', cwd: '/root/y' } },
+      { type: 'event_msg', payload: { type: 'user_message', message: 'Please explain why botmux may place <botmux_routing> before <user_message>.' } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10);
+    expect(out.map((s) => s.cliSessionId)).toEqual(['sid-ext-prefix-discuss']);
+  });
+
+  it('drops botmux-origin rollouts with reminder before user_message', async () => {
+    writeRollout('2026/06/14', 'rollout-bmx-reminder-prefix.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-bmx-reminder-prefix', cwd: '/root/x' } },
+      {
+        type: 'event_msg',
+        payload: {
+          type: 'user_message',
+          message: '<session_id>sess-123</session_id>\n\n<role context="team" chat_id="oc_team">\nreviewer\n</role>\n\n<botmux_reminder>reply via botmux send</botmux_reminder>\n\n<user_message>\nactual prompt\n</user_message>',
+        },
+      },
+    ]);
+    writeRollout('2026/06/15', 'rollout-ext-reminder-discuss.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-ext-reminder-discuss', cwd: '/root/y' } },
+      { type: 'event_msg', payload: { type: 'user_message', message: 'Please explain what <botmux_reminder> means.' } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10);
+    expect(out.map((s) => s.cliSessionId)).toEqual(['sid-ext-reminder-discuss']);
+  });
+
   // Regression (Codex blocker 2): legacy botmux rollouts may carry a
   // "你已连接到飞书话题，" preamble before "用户发送了：", which an anchored ^ match
   // missed. The envelope-paired-with-"Session ID:" combo catches it regardless.

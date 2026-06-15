@@ -97,11 +97,15 @@ function truncateTitle(text: string): string {
 //  (common in this repo: "explain <botmux_routing>", "why does <sender type=
 //  appear") is NOT mis-flagged.
 const BOTMUX_INJECTION_PATTERNS: readonly RegExp[] = [
-  // The whole prompt IS a botmux envelope — it STARTS with the opening wrapper.
-  // botmux wraps every forwarded AND scheduled message this way; an external
-  // prompt that merely discusses the tags has them mid-text, not leading. This
-  // also catches scheduled-task sessions that carry no trailing <sender> block.
+  // The whole prompt IS a botmux envelope. Older prompts START with the opening
+  // wrapper; newer non-injecting CLIs place stable routing/identity/session
+  // blocks first, then the wrapper. External prompts may discuss these tags
+  // mid-text, but they don't start with this structural envelope.
   /^<user_message>[\s\S]*?<\/user_message>/,
+  /^<botmux_routing>[\s\S]*?<\/botmux_routing>\s*(?:<identity>[\s\S]*?<\/identity>\s*)?<session_id>[^<]+<\/session_id>\s*(?:<role\b[\s\S]*?<\/role>\s*)?(?:<botmux_reminder>[\s\S]*?<\/botmux_reminder>\s*)?<user_message>[\s\S]*?<\/user_message>/,
+  /^<role\s+context="(?:team|group)"\s+chat_id="[^"]+">[\s\S]*?<\/role>\s*(?:<session_id>[^<]+<\/session_id>\s*)?(?:<botmux_reminder>[\s\S]*?<\/botmux_reminder>\s*)?<user_message>[\s\S]*?<\/user_message>/,
+  /^<session_id>[^<]+<\/session_id>\s*(?:<role\b[\s\S]*?<\/role>\s*)?(?:<botmux_reminder>[\s\S]*?<\/botmux_reminder>\s*)?<user_message>[\s\S]*?<\/user_message>/,
+  /^<botmux_reminder>[\s\S]*?<\/botmux_reminder>\s*<user_message>[\s\S]*?<\/user_message>/,
   /^用户发送了：\s*\n-{3,}/,
   // Modern envelope: the `</user_message>` close butted up against one of
   // botmux's trailing blocks (claude → <sender>, codex/traex → <session_id>,

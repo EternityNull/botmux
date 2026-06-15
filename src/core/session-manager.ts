@@ -235,6 +235,16 @@ export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: L
   return `<attachments hint="${xmlEscape(t('ai.attach.hint', undefined, locale))}">\n${items.join('\n')}\n</attachments>`;
 }
 
+function renderRoleContextBlock(larkAppId: string | undefined, chatId: string | undefined): string {
+  if (!larkAppId || !chatId) return '';
+
+  const { content: roleContent, source: roleSource } = resolveRole(larkAppId, chatId);
+  if (!roleContent) return '';
+
+  const ctx = roleSource === 'team' ? 'team' : 'group';
+  return `<role context="${ctx}" chat_id="${xmlEscape(chatId)}">\n${roleContent}\n</role>`;
+}
+
 export function buildNewTopicPrompt(
   userMessage: string,
   sessionId: string,
@@ -272,14 +282,7 @@ export function buildNewTopicPrompt(
     ].join('\n');
   }
 
-  let roleBlock = '';
-  if (opts?.larkAppId && opts?.chatId) {
-    const { content: roleContent, source: roleSource } = resolveRole(opts.larkAppId, opts.chatId);
-    if (roleContent) {
-      const ctx = roleSource === 'team' ? 'team' : 'group';
-      roleBlock = `<role context="${ctx}" chat_id="${xmlEscape(opts.chatId)}">\n${roleContent}\n</role>`;
-    }
-  }
+  const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
 
   let mentionBlock = '';
   if (mentions && mentions.length > 0) {
@@ -312,7 +315,19 @@ export function buildNewTopicPrompt(
     ? [userMessage, ...followUps].join('\n\n')
     : userMessage;
   const userBlock = `<user_message>\n${mergedMessage}\n</user_message>`;
-  const parts: string[] = [userBlock];
+  const parts: string[] = [];
+
+  // Put stable, instruction-like context before the user's first turn. This
+  // improves salience without moving per-turn attribution (sender/mentions)
+  // into the prompt-cache prefix.
+  if (!adapter.injectsSessionContext) {
+    if (routingBlock) parts.push(routingBlock);
+    if (identityBlock) parts.push(identityBlock);
+    parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
+  }
+  if (roleBlock) parts.push(roleBlock);
+
+  parts.push(userBlock);
 
   const senderBlock = renderSenderTag(sender);
   if (senderBlock) parts.push(senderBlock);
@@ -325,12 +340,6 @@ export function buildNewTopicPrompt(
 
   // CLIs with injectsSessionContext (Claude Code) get Lark routing/identity
   // and session ID via system prompt, so skip those blocks here.
-  if (!adapter.injectsSessionContext) {
-    parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
-    if (routingBlock) parts.push(routingBlock);
-    if (identityBlock) parts.push(identityBlock);
-  }
-  if (roleBlock) parts.push(roleBlock);
   if (mentionBlock) parts.push(mentionBlock);
   if (botBlock) parts.push(botBlock);
 
@@ -347,7 +356,22 @@ export function buildFollowUpContent(
   sessionId: string,
   opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string },
 ): string {
-  const parts: string[] = [`<user_message>\n${content}\n</user_message>`];
+  const parts: string[] = [];
+  const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
+  const skipSessionId = opts?.isAdoptMode || (opts?.cliId
+    ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
+    : false);
+
+  // Put stable context before the user's turn. Follow the new-topic order for
+  // shared blocks: session id first, then role. Keep per-turn attribution and
+  // attachments after <user_message>.
+  if (!skipSessionId) parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
+  if (roleBlock) parts.push(roleBlock);
+  if (opts?.cliId !== 'mira') {
+    parts.push(`<botmux_reminder>${t('ai.followup.reminder', undefined, opts?.locale)}</botmux_reminder>`);
+  }
+
+  parts.push(`<user_message>\n${content}\n</user_message>`);
 
   const senderBlock = renderSenderTag(opts?.sender);
   if (senderBlock) parts.push(senderBlock);
@@ -360,34 +384,12 @@ export function buildFollowUpContent(
     : '';
   if (attachHint) parts.push(attachHint);
 
-  // Inject role for follow-up messages: per-chat override ＞ team default (same as buildNewTopicPrompt)
-  if (opts?.larkAppId && opts?.chatId) {
-    const { content: roleContent, source: roleSource } = resolveRole(opts.larkAppId, opts.chatId);
-    if (roleContent) {
-      const ctx = roleSource === 'team' ? 'team' : 'group';
-      parts.push(`<role context="${ctx}" chat_id="${xmlEscape(opts.chatId)}">\n${roleContent}\n</role>`);
-    }
-  }
-
-  if (!opts?.isAdoptMode) {
-    const skipSessionId = opts?.cliId
-      ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
-      : false;
-    if (!skipSessionId) {
-      parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
-    }
-  }
-
   if (opts?.mentions && opts.mentions.length > 0) {
     const items = opts.mentions.map(m => {
       const oid = m.openId ? ` open_id="${xmlEscape(m.openId)}"` : '';
       return `  <mention name="${xmlEscape(m.name)}"${oid} />`;
     });
     parts.push(`<mentions>\n${items.join('\n')}\n</mentions>`);
-  }
-
-  if (opts?.cliId !== 'mira') {
-    parts.push(`<botmux_reminder>${t('ai.followup.reminder', undefined, opts?.locale)}</botmux_reminder>`);
   }
 
   return parts.join('\n\n');
