@@ -1,13 +1,15 @@
 import { existsSync, statSync } from 'node:fs';
 import { basename, isAbsolute, relative } from 'node:path';
 import { resolveSessionTranscriptPath } from '../transcript-resolver.js';
-import { isReadPhase, isWritePhase } from './classify.js';
+import { isReadPhase, isWritePhase, isInteractiveWaitTool } from './classify.js';
+import { buildSubagentLanes } from './subagent-reader.js';
 import { parseAntigravityInsight } from './antigravity-span-reader.js';
 import { parseClaudeInsight } from './claude-span-reader.js';
 import { parseCodexInsight } from './codex-span-reader.js';
 import { safeErrorMessage, toSafeSpan } from './redact.js';
 import type {
   AgentSay,
+  SafeInsightHot,
   InsightDetail,
   InsightDiagnosticKind,
   InsightConversationMessage,
@@ -192,6 +194,13 @@ function cachedParseForKind(kind: string, path: string): InsightParseResult | nu
   return parsed;
 }
 
+// A span is "slow" only if it actually spent that time working — tools that block
+// on a human reply (ask-question / plan approval) are excluded everywhere slowness
+// is judged, since their duration is mostly user idle, not a slow operation.
+function isSlowSpan(span: { tool: string; durationMs?: number }, slowThresholdMs: number): boolean {
+  return (span.durationMs ?? 0) >= slowThresholdMs && !isInteractiveWaitTool(span.tool);
+}
+
 function aggregate(spans: RawInsightSpan[], compactions: number, slowThresholdMs: number): SafeInsightAggregate {
   const agg = emptyAgg();
   agg.totalSpans = spans.length;
@@ -200,13 +209,17 @@ function aggregate(spans: RawInsightSpan[], compactions: number, slowThresholdMs
   let writes = 0;
   for (const s of spans) {
     const phase = INSIGHT_PHASES.includes(s.phase) ? s.phase : 'discuss';
+    // User-blocking tools (ask-question / plan approval) spend their wall-clock
+    // waiting on a human, not working — count the action but not its duration,
+    // and never flag it as a slow span.
+    const waits = isInteractiveWaitTool(s.tool);
     agg.phase[phase].count++;
-    if (s.durationMs !== undefined) agg.phase[phase].ms += Math.max(0, Math.round(s.durationMs));
+    if (s.durationMs !== undefined && !waits) agg.phase[phase].ms += Math.max(0, Math.round(s.durationMs));
     if (s.status === 'error') {
       agg.failedSpans++;
       agg.failByTool[s.tool] = (agg.failByTool[s.tool] ?? 0) + 1;
     }
-    if ((s.durationMs ?? 0) >= slowThresholdMs) agg.slowSpans++;
+    if (isSlowSpan(s, slowThresholdMs)) agg.slowSpans++;
     if (isReadPhase(phase)) reads++;
     if (isWritePhase(phase)) writes++;
   }
@@ -243,7 +256,7 @@ function suggestionsFor(agg: SafeInsightAggregate, spans: RawInsightSpan[], slow
   }
 
   const slowest = spans
-    .filter(s => s.durationMs !== undefined)
+    .filter(s => s.durationMs !== undefined && !isInteractiveWaitTool(s.tool))
     .sort((a, b) => (b.durationMs ?? 0) - (a.durationMs ?? 0))[0];
   if (slowest && (slowest.durationMs ?? 0) >= slowThresholdMs) {
     out.push({
@@ -355,7 +368,7 @@ function diagnosticForSuggestion(
 
   if (s.id === 'slow_span') {
     const slowSpans = spans
-      .filter(span => (span.durationMs ?? 0) >= slowThresholdMs)
+      .filter(span => isSlowSpan(span, slowThresholdMs))
       .sort((a, b) => (b.durationMs ?? 0) - (a.durationMs ?? 0));
     const slowSet = new Set(slowSpans);
     const t = target(span => slowSet.has(span));
@@ -433,7 +446,7 @@ function selectVisibleSpans(spans: RawInsightSpan[], maxSpans: number, slowThres
     }
   };
   addWhere(span => span.status === 'error');
-  addWhere(span => (span.durationMs ?? 0) >= slowThresholdMs);
+  addWhere(span => isSlowSpan(span, slowThresholdMs));
   addWhere(() => true);
   return [...selected].sort((a, b) => a - b).map(i => spans[i]!);
 }
@@ -578,6 +591,56 @@ function buildWorkSummary(spans: RawInsightSpan[], safeSpans: SafeSpan[] | undef
   return { fileChanges, commandsRun };
 }
 
+// Compact per-session rollup for cross-session recurrence hotspots. Computed from raw
+// spans alone (filePaths→safe label, evidence.command already a scrubbed preview, tool +
+// result enum), so it's cheap enough to include in summary mode. Top-N capped.
+function buildSessionHot(spans: RawInsightSpan[], cwd: string | undefined): SafeInsightHot {
+  const files = new Map<string, { path: string; reads: number; edits: number; added: number; removed: number }>();
+  const cmds = new Map<string, { cmd: string; runs: number; fails: number }>();
+  const errs = new Map<string, { tool: string; result: string; count: number }>();
+  for (const span of spans) {
+    for (const rawPath of span.filePaths ?? []) {
+      const label = safeFilePathLabel(rawPath, cwd);
+      const f = files.get(label) ?? { path: label, reads: 0, edits: 0, added: 0, removed: 0 };
+      if (isReadPhase(span.phase)) f.reads++;
+      if (isWritePhase(span.phase)) {
+        f.edits++;
+        const c = span.lineCounts ?? patchLineCounts(span.patchText);
+        if (c) { f.added += c.added; f.removed += c.removed; }
+      }
+      files.set(label, f);
+    }
+    // Command recurrence keyed by the SAFE intent (kind + safe subject) — never the
+    // raw command text, which must not cross into the summary/overview (redaction
+    // invariant: command previews live only in per-session detail).
+    if (span.phase === 'run' && span.intent && span.intent.kind !== 'unknown') {
+      const subj = span.intent.subject;
+      const label = subj ? (subj.startsWith(span.intent.kind) ? subj : `${span.intent.kind} ${subj}`) : span.intent.kind;
+      if (label) {
+        const c = cmds.get(label) ?? { cmd: label, runs: 0, fails: 0 };
+        c.runs++;
+        if (span.status === 'error') c.fails++;
+        cmds.set(label, c);
+      }
+    }
+    if (span.status === 'error') {
+      const result = span.result?.category ?? 'tool_error';
+      const key = `${span.tool}\u0000${result}`;
+      const e = errs.get(key) ?? { tool: span.tool, result, count: 0 };
+      e.count++;
+      errs.set(key, e);
+    }
+  }
+  return {
+    files: [...files.values()]
+      .map(f => ({ path: f.path, reads: f.reads, edits: f.edits, ...(f.added || f.removed ? { added: f.added, removed: f.removed } : {}) }))
+      .sort((a, b) => (b.edits + b.reads) - (a.edits + a.reads) || ((b.added ?? 0) + (b.removed ?? 0)) - ((a.added ?? 0) + (a.removed ?? 0)))
+      .slice(0, 12),
+    cmds: [...cmds.values()].sort((a, b) => b.fails - a.fails || b.runs - a.runs).slice(0, 12),
+    errs: [...errs.values()].sort((a, b) => b.count - a.count).slice(0, 8),
+  };
+}
+
 function spanKey(span: RawInsightSpan): string {
   const intent = span.intent;
   return `${intent?.kind ?? 'unknown'}:${intent?.subject ?? ''}:${intent?.detail ?? ''}`;
@@ -600,7 +663,7 @@ function tagsForVisibleSpans(spans: RawInsightSpan[], slowThresholdMs: number): 
   return spans.map(span => {
     const tags = new Set<SafeSpanTag>();
     if (span.status === 'error') tags.add('failure');
-    if ((span.durationMs ?? 0) >= slowThresholdMs) tags.add('slow');
+    if (isSlowSpan(span, slowThresholdMs)) tags.add('slow');
     const key = spanKey(span);
     if (!key.startsWith('unknown:') && (counts.get(key) ?? 0) > 1) tags.add('retry');
     const tc = turnCounts.get(span.turnIndex);
@@ -639,7 +702,7 @@ function buildTurnDiagnostics(visibleSpans: RawInsightSpan[] | undefined, slowTh
     if (isWritePhase(span.phase)) acc.edits++;
     if (span.phase === 'run') acc.runs++;
     if (span.status === 'error') acc.failures++;
-    if (span.durationMs !== undefined) acc.durationMs += Math.max(0, Math.round(span.durationMs));
+    if (span.durationMs !== undefined && !isInteractiveWaitTool(span.tool)) acc.durationMs += Math.max(0, Math.round(span.durationMs));
     acc.spanIndexes.push(i);
     for (const tag of spanTags[i] ?? []) {
       if (tag !== 'normal') acc.tags.add(tag);
@@ -811,7 +874,10 @@ function metricsForTimeline(spans: SafeSpan[]): TurnEfficiencyDiagnostic['metric
     if (isWritePhase(span.phase)) acc.edits++;
     if (span.phase === 'run') acc.runs++;
     if (span.status === 'error') acc.failures++;
-    if (span.durationMs !== undefined) acc.durationMs += span.durationMs;
+    // Exclude interactive-wait tools (ask-question / plan approval): their
+    // duration is user idle, not work — must match aggregate / buildTurnDiagnostics
+    // so the timeline turn metric doesn't show 119s of "waiting for the user".
+    if (span.durationMs !== undefined && !isInteractiveWaitTool(span.tool)) acc.durationMs += span.durationMs;
     return acc;
   }, { reads: 0, edits: 0, runs: 0, failures: 0, durationMs: 0 });
 }
@@ -1125,11 +1191,22 @@ export function buildSafeInsightReport(q: InsightReportQuery, opts: BuildInsight
     turnTimeline,
   };
 
+  // Compact recurrence rollup — included in BOTH modes so the overview (summary mode)
+  // can aggregate file/command/error hotspots cross-session without heavy detail.
+  report.hot = buildSessionHot(parsed.spans, q.cwd);
+
   if (detail === 'spans' && visible) {
     report.spans = visible;
     report.meta.spansReturned = visible.length;
     report.meta.capped = parsed.spans.length > visible.length;
     report.workSummary = buildWorkSummary(visibleRaw ?? [], visible, q.cwd);
+    // Delegated sub-agents (Claude only) — one extra file parse each, so detail-mode only.
+    // Route through the shared parse cache so repeated detail fetches don't re-read
+    // unchanged sub-agent transcripts.
+    if (resolved.kind === 'claude') {
+      const lanes = buildSubagentLanes(resolved.path, p => cachedParseForKind('claude', p));
+      if (lanes.length) report.subagents = lanes;
+    }
   }
 
   return report;
@@ -1221,16 +1298,16 @@ export async function buildSafeInsightOverview(
   const reports = rows.map(r => r.report);
   const okReports = reports.filter(r => r.status === 'ok');
   const agg = emptyAgg();
-  let rwSum = 0;
-  let rwN = 0;
   for (const report of okReports) {
     mergeAgg(agg, report.agg);
-    if (report.agg.readWriteRatio !== null) {
-      rwSum += report.agg.readWriteRatio;
-      rwN++;
-    }
   }
-  agg.readWriteRatio = rwN > 0 ? Math.round((rwSum / rwN) * 100) / 100 : null;
+  // Pooled read/write ratio (Σresearch ÷ Σedit), matching the dashboard's
+  // client-side aggregate. Averaging per-session ratios would let a tiny
+  // 2-read/1-write session weigh the same as a 300-read/100-write one and
+  // skew the headline, so pool the totals instead.
+  agg.readWriteRatio = agg.phase.edit.count > 0
+    ? Math.round((agg.phase.research.count / agg.phase.edit.count) * 100) / 100
+    : null;
   return {
     generatedAt: parsedAt,
     meta: {
@@ -1278,16 +1355,16 @@ export function mergeSafeInsightOverviews(
   const reports = rows.map(r => r.report);
   const okReports = reports.filter(r => r.status === 'ok');
   const agg = emptyAgg();
-  let rwSum = 0;
-  let rwN = 0;
   for (const report of okReports) {
     mergeAgg(agg, report.agg);
-    if (report.agg.readWriteRatio !== null) {
-      rwSum += report.agg.readWriteRatio;
-      rwN++;
-    }
   }
-  agg.readWriteRatio = rwN > 0 ? Math.round((rwSum / rwN) * 100) / 100 : null;
+  // Pooled read/write ratio (Σresearch ÷ Σedit), matching the dashboard's
+  // client-side aggregate. Averaging per-session ratios would let a tiny
+  // 2-read/1-write session weigh the same as a 300-read/100-write one and
+  // skew the headline, so pool the totals instead.
+  agg.readWriteRatio = agg.phase.edit.count > 0
+    ? Math.round((agg.phase.research.count / agg.phase.edit.count) * 100) / 100
+    : null;
   return {
     generatedAt,
     meta: {
