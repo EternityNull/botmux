@@ -91,7 +91,8 @@ import { botDefaultsPayload, botSummaryPayload } from './dashboard/bot-payload.j
 import { isValidRoleProfileId } from './services/role-profile-store.js';
 import { mergeSafeInsightOverviews } from './services/insight/report.js';
 import type { SafeInsightOverview } from './services/insight/types.js';
-import { readPlatformBinding } from './platform/binding.js';
+import { watch as fsWatch } from 'node:fs';
+import { readPlatformBinding, PLATFORM_BINDING_PATH } from './platform/binding.js';
 import { startPlatformTunnelClient } from './platform/tunnel-client.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
 
@@ -2326,6 +2327,7 @@ listenWithProbe({
   }
   logger.info(`[dashboard] listening on ${config.dashboard.host}:${port}`);
   startPlatformTunnelIfBound();
+  watchPlatformBinding(); // bind 后无需重启 daemon，自动连接平台
 }).catch((err) => {
   logger.error(`[dashboard] could not bind near ${config.dashboard.host}:${config.dashboard.port} after probing — set BOTMUX_DASHBOARD_PORT to a free port. ${(err as Error).message}`);
   process.exit(1);
@@ -2344,6 +2346,8 @@ federationSync.unref();
 
 // 中心化平台隧道（已绑定才启动；每台机器一个，跑在 dashboard 进程里）
 let platformTunnel: { stop(): void } | null = null;
+// 当前隧道对应的绑定身份（platformUrl|machineId|machineToken）；用于判断 bind 变化是否需要重连
+let platformBindingKey: string | null = null;
 function readBotmuxVersion(): string {
   try {
     const pkg = JSON.parse(readFileSync(join(dirname(__dirname), 'package.json'), 'utf8'));
@@ -2355,7 +2359,10 @@ function readBotmuxVersion(): string {
 function startPlatformTunnelIfBound(): void {
   try {
     const binding = readPlatformBinding();
-    if (!binding) return;
+    if (!binding) {
+      platformBindingKey = null;
+      return;
+    }
     const version = readBotmuxVersion();
     platformTunnel = startPlatformTunnelClient({
       binding,
@@ -2364,9 +2371,45 @@ function startPlatformTunnelIfBound(): void {
       getVersion: () => version,
       log: (msg, extra) => logger.info(`[platform-tunnel] ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`),
     });
+    platformBindingKey = `${binding.platformUrl}|${binding.machineId}|${binding.machineToken}`;
     logger.info(`[platform-tunnel] 绑定到 ${binding.platformUrl}，启动隧道`);
   } catch (e) {
     logger.warn(`[platform-tunnel] 启动失败: ${(e as Error).message}`);
+  }
+}
+
+/**
+ * 监听绑定文件变化：`botmux bind` 写入后无需重启 daemon，自动连接平台。
+ * 只在绑定「身份」(platformUrl/machineId/machineToken) 变化时重连——团队成员变化也会改写该文件
+ * （tunnel-client 自己写的），那种不重连，避免反复重启。
+ */
+function watchPlatformBinding(): void {
+  let timer: NodeJS.Timeout | null = null;
+  const onChange = (): void => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      const b = readPlatformBinding();
+      const key = b ? `${b.platformUrl}|${b.machineId}|${b.machineToken}` : null;
+      if (key === platformBindingKey) return; // 没变（或仅团队变化）→ 不重连
+      logger.info('[platform-tunnel] 检测到绑定变化，重连平台');
+      try {
+        platformTunnel?.stop();
+      } catch {
+        /* ignore */
+      }
+      platformTunnel = null;
+      startPlatformTunnelIfBound();
+    }, 800);
+  };
+  try {
+    // 监听所在目录而非文件本身——绑定走原子写（临时文件 + rename），直接 watch 文件会在 rename 后失效
+    const dir = dirname(PLATFORM_BINDING_PATH);
+    const base = PLATFORM_BINDING_PATH.slice(dir.length + 1);
+    fsWatch(dir, (_event, filename) => {
+      if (!filename || filename === base) onChange();
+    });
+  } catch (e) {
+    logger.warn(`[platform-tunnel] 绑定文件监听启动失败: ${(e as Error).message}`);
   }
 }
 

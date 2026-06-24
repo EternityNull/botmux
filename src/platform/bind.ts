@@ -87,5 +87,6 @@ export async function cmdBind(args: string[]): Promise<void> {
 
   console.log(`✓ 已绑定到平台 ${platformUrl}`);
   console.log(`  机器名: ${name}`);
-  console.log('  运行 `botmux dashboard` 后，平台即可看到并打开这台机器的 dashboard。');
+  console.log('  若 botmux 正在运行，会自动连接平台（约 1 秒，无需重启）；');
+  console.log('  若尚未运行，启动 botmux 即可在平台看到并打开这台机器的 dashboard。');
 }
